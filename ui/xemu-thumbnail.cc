@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <fpng.h>
 #include <vector>
+#include <glib.h>
 
 #include "xemu-snapshots.h"
 #include "xui/gl-helpers.hh"

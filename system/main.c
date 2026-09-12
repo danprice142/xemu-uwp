@@ -36,7 +36,7 @@
  * some platforms; it does so via a macro that renames our main function, so
  * <SDL.h> must be #included here even with no SDL code called from this file.
  */
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #endif
 
 #ifdef CONFIG_DARWIN

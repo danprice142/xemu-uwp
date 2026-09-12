@@ -59,6 +59,7 @@
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+#include <glib.h>
 
 #ifndef DEBUG_XEMU_C
 #define DEBUG_XEMU_C 0
@@ -128,7 +129,6 @@ static uint64_t lock_start;
 
 void xemu_main_loop_lock(void)
 {
-    qemu_mutex_lock_main_loop();
     bql_lock();
 #if DEBUG_XEMU_C
     lock_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -141,7 +141,6 @@ void xemu_main_loop_unlock(void)
     lock_held_acc += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - lock_start;
 #endif
     bql_unlock();
-    qemu_mutex_unlock_main_loop();
 }
 
 SDL_Window *xemu_get_window(void)
@@ -1208,7 +1207,6 @@ static void *qemu_main(void *opaque)
     exit_status = qemu_main_loop();
     qatomic_set(&qemu_exiting, true);
     bql_unlock();
-    qemu_mutex_unlock_main_loop();
 
     qemu_sem_wait(&display_shutdown_sem);
     bql_lock();

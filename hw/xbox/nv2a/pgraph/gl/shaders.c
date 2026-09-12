@@ -256,7 +256,11 @@ static const char *shader_gl_vendor = NULL;
 static void shader_create_cache_folder(void)
 {
     char *shader_path = g_strdup_printf("%sshaders", xemu_settings_get_base_path());
-    qemu_mkdir(shader_path);
+#ifdef _WIN32
+    mkdir(shader_path);
+#else
+    mkdir(shader_path, 0755);
+#endif
     g_free(shader_path);
 }
 
@@ -610,7 +614,11 @@ static void *shader_write_to_disk(void *arg)
         xemu_version_len = (uint64_t) (strlen(xemu_version) + 1);
     }
 
-    qemu_mkdir(shader_bin);
+#ifdef _WIN32
+    mkdir(shader_bin);
+#else
+    mkdir(shader_bin, 0755);
+#endif
     g_free(shader_bin);
 
     FILE *shader_file = qemu_fopen(shader_path, "wb");

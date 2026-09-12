@@ -803,6 +803,11 @@ if get_option('libretro')
   endif
 endif
 
+qemu_cflags += ['-DXBOX']
+if 'cpp' in all_languages
+  qemu_cxxflags += ['-DXBOX']
+endif
+
 add_project_arguments(qemu_cflags, native: false, language: 'c')
 add_project_arguments(cc.get_supported_arguments(warn_flags), native: false, language: 'c')
 if 'cpp' in all_languages
