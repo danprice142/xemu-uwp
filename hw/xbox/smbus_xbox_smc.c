@@ -49,6 +49,8 @@
 # define DPRINTF(format, ...) do { } while (0)
 #endif
 
+#define ACPI_EXTSMI_STATUS 0x0010 
+
 /*
  * Hardware is a PIC16LC
  * http://www.xbox-linux.org/wiki/PIC

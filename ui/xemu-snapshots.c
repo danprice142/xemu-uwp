@@ -155,7 +155,7 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
 
     qdict_put_bool(opts, BDRV_OPT_READ_ONLY, true);
     bs_ro = bdrv_open(g_config.sys.files.hdd_path, NULL, opts,
-                      BDRV_O_RO_WRITE_SHARE | BDRV_O_AUTO_RDONLY, err);
+                      BDRV_O_AUTO_RDONLY, err);
     if (!bs_ro) {
         return;
     }

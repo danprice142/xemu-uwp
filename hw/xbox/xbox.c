@@ -33,13 +33,16 @@
 #include "hw/ide/pci.h"
 #include "system/system.h"
 #include "system/kvm.h"
+#ifndef _WIN32
 #include "kvm/kvm_i386.h"
+#endif
 #include "hw/dma/i8257.h"
 
 #include "hw/sysbus.h"
 #include "system/arch_init.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include "system/tcg.h"
 #include "cpu.h"
 
 #include "qapi/error.h"
@@ -272,18 +275,17 @@ void xbox_init_common(MachineState *machine,
     pc_i8259_create(isa_bus, gsi_state->i8259_irq);
 
     if (tcg_enabled()) {
-        x86_register_ferr_irq(x86ms->gsi[13]);
+        // x86_register_ferr_irq(x86ms->gsi[13]);
     }
 
     /* init basic PC hardware */
     rtc_state = mc146818_rtc_init(isa_bus, 2000, NULL);
     x86ms->rtc = ISA_DEVICE(rtc_state);
 
-    if (kvm_pit_in_kernel()) {
+    if (false)
         pit = kvm_pit_init(isa_bus, 0x40);
-    } else {
+    else
         pit = i8254_pit_init(isa_bus, 0x40, pit_isa_irq, pit_alt_irq);
-    }
 
     i8257_dma_init(OBJECT(machine), isa_bus, 0);
 
@@ -454,7 +456,7 @@ static void xbox_machine_options(MachineClass *m)
     m->rom_file_has_mr   = false;
     m->no_floppy         = 1,
     m->no_cdrom          = 1,
-    m->default_cpu_type  = X86_CPU_TYPE_NAME("pentium3");
+    m->default_cpu_type  = "pentium3-x86_64-cpu"; 
     m->is_default        = true;
     m->default_nic       = "nvnet";
 

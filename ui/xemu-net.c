@@ -109,7 +109,7 @@ void xemu_net_enable(void)
     }
 
     if (g_config.net.backend == CONFIG_NET_BACKEND_NAT) {
-        void *s = slirp_get_state_from_netdev(id);
+        void *s = NULL;
         assert(s != NULL);
 
         struct in_addr host_addr = { .s_addr = INADDR_ANY };
@@ -166,7 +166,7 @@ static void remove_netdev(const char *name)
 
 static void clear_slirp_port_forwards(void)
 {
-    void *s = slirp_get_state_from_netdev(id);
+    void *s = NULL;
     if (!s) {
         return;
     }

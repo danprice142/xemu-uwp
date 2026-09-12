@@ -23,6 +23,7 @@
 #include "hw/display/vga_int.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/pgraph/util.h"
+#include "system/tcg.h"
 #include "renderer.h"
 
 #include <math.h>

@@ -27,6 +27,7 @@
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "qemu/compiler.h"
 #include "ui/xemu-settings.h"
+#include "system/tcg.h"
 #include "renderer.h"
 
 const int num_invalid_surfaces_to_keep = 10;  // FIXME: Make automatic
@@ -583,9 +584,10 @@ static void register_cpu_access_callback(NV2AState *d, SurfaceBinding *surface)
 {
     if (tcg_enabled()) {
         if (surface->width && surface->height) {
-            surface->access_cb = mem_access_callback_insert(
-                qemu_get_cpu(0), d->vram, surface->vram_addr, surface->size,
-                &surface_access_callback, d);
+            // surface->access_cb = mem_access_callback_insert(
+            //     qemu_get_cpu(0), d->vram, surface->vram_addr, surface->size,
+            //     &surface_access_callback, d);
+            surface->access_cb = NULL;
         } else {
             surface->access_cb = NULL;
         }
@@ -596,7 +598,7 @@ static void unregister_cpu_access_callback(NV2AState *d,
                                            SurfaceBinding const *surface)
 {
     if (tcg_enabled()) {
-        mem_access_callback_remove_by_ref(qemu_get_cpu(0), surface->access_cb);
+        // mem_access_callback_remove_by_ref(qemu_get_cpu(0), surface->access_cb);
     }
 }
 
