@@ -32,11 +32,17 @@
 #include "xemu-settings.h"
 #include <SDL3/SDL.h>
 
+#if defined(CONFIG_UWP) || defined(XEMU_UWP)
+#define XEMU_INPUT_UWP 1
+#endif
+
 #define DRIVER_DUKE "usb-xbox-gamepad"
 #define DRIVER_S "usb-xbox-gamepad-s"
+#define DRIVER_LIGHTGUN "usb-xbox-lightgun"
 
 #define DRIVER_DUKE_DISPLAY_NAME "Xbox Controller"
 #define DRIVER_S_DISPLAY_NAME "Xbox Controller S"
+#define DRIVER_LIGHTGUN_DISPLAY_NAME "EMS TopGun II"
 
 enum controller_state_buttons_mask {
     CONTROLLER_BUTTON_A          = (1 << 0),
@@ -54,6 +60,7 @@ enum controller_state_buttons_mask {
     CONTROLLER_BUTTON_LSTICK     = (1 << 12),
     CONTROLLER_BUTTON_RSTICK     = (1 << 13),
     CONTROLLER_BUTTON_GUIDE      = (1 << 14), // Extension
+    CONTROLLER_BUTTON_LIGHTGUN_ONSCREEN = (1 << 15), // Extension
 };
 
 #define CONTROLLER_STATE_BUTTON_ID_TO_MASK(x) (1<<x)
@@ -71,7 +78,16 @@ enum controller_state_axis_index {
 enum controller_input_device_type {
     INPUT_DEVICE_SDL_KEYBOARD,
     INPUT_DEVICE_SDL_GAMEPAD,
+#ifdef XEMU_INPUT_UWP
+    INPUT_DEVICE_UWP_GAMEPAD,
+#endif
+    INPUT_DEVICE_DSU_GAMEPAD,
 };
+
+typedef struct XemuInputSample {
+    uint16_t buttons;
+    int16_t axis[CONTROLLER_AXIS__COUNT];
+} XemuInputSample;
 
 enum peripheral_type { PERIPHERAL_NONE, PERIPHERAL_XMU, PERIPHERAL_TYPE_COUNT };
 
@@ -103,6 +119,14 @@ typedef struct ControllerState {
     SDL_Joystick       *sdl_joystick;
     SDL_JoystickID      sdl_joystick_id;
     SDL_GUID            sdl_joystick_guid;
+#ifdef XEMU_INPUT_UWP
+    int                 uwp_gamepad_index;
+    uint64_t            uwp_gamepad_last_timestamp;
+    bool                uwp_gamepad_logged_input;
+    uint16_t            uwp_last_rumble_l;
+    uint16_t            uwp_last_rumble_r;
+    bool                uwp_last_rumble_valid;
+#endif
 
     enum peripheral_type peripheral_types[2];
     void *peripherals[2];
@@ -130,8 +154,16 @@ void xemu_input_update_controllers(void);
 void xemu_input_update_controller(ControllerState *state);
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state);
 void xemu_input_update_sdl_controller_state(ControllerState *state);
+#ifdef XEMU_INPUT_UWP
+void xemu_input_update_uwp_gamepad_controller_state(ControllerState *state);
+#endif
 void xemu_input_update_rumble(ControllerState *state);
 ControllerState *xemu_input_get_bound(int index);
+bool xemu_input_get_effective_state(unsigned index, XemuInputSample *out);
+/* Merged buttons and axes of connected network (DSU) gamepads, so they can
+ * drive the user interface like local controllers. */
+bool xemu_input_get_dsu_ui_sample(XemuInputSample *out);
+void xemu_input_set_rumble(unsigned index, uint16_t left, uint16_t right);
 void xemu_input_bind(int index, ControllerState *state, int save);
 bool xemu_input_bind_xmu(int player_index, int peripheral_port_index,
                          const char *filename, bool is_rebind);

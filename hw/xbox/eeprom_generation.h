@@ -56,5 +56,18 @@ typedef enum {
 
 bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver);
 
+/* Video flags in the user section, as set by the dashboard. */
+#define XBOX_EEPROM_VIDEO_FLAGS_OFFSET \
+    (offsetof(XboxEEPROM, user_section) + 0x30)
+#define XBOX_EEPROM_VIDEO_WIDESCREEN 0x00010000
+#define XBOX_EEPROM_VIDEO_LETTERBOX 0x00100000
+
+/*
+ * Sets and clears video flags in a 256-byte EEPROM image and updates the
+ * user section checksum. Returns whether the image changed.
+ */
+bool xbox_eeprom_set_video_flags(uint8_t *eeprom, uint32_t set,
+                                 uint32_t clear);
+
 #endif
 

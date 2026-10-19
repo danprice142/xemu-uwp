@@ -28,6 +28,9 @@
 
 using FileDialogCallback = std::function<void(const char *path)>;
 
+// Runs func on the main thread with the main loop lock held.
+void RunOnMainThread(std::function<void()> &&func);
+
 void ShowOpenFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
                         const char *default_location,
                         FileDialogCallback callback);

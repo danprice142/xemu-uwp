@@ -8737,6 +8737,7 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
     cpu_set_fpuc(env, 0x37f);
 
     env->mxcsr = 0x1f80;
+    cpu_sync_sse_default_hflag(env);
     /* All units are in INIT state.  */
     env->xstate_bv = 0;
 

@@ -22,7 +22,9 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/osdep.h"
 #include "xemu-widescreen.h"
+#include "xemu-settings.h"
 
 static bool g_widescreen = false;
 
@@ -34,4 +36,12 @@ void xemu_set_widescreen(bool widescreen)
 bool xemu_get_widescreen(void)
 {
     return g_widescreen;
+}
+
+bool xemu_get_widescreen_tv(void)
+{
+    return g_config.display.ui.aspect_ratio ==
+               CONFIG_DISPLAY_UI_ASPECT_RATIO_AUTO ||
+           g_config.display.ui.aspect_ratio ==
+               CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9;
 }

@@ -21,6 +21,8 @@
 #include "xemu-settings.h"
 #include <assert.h>
 #include <cmath>
+#include <cstdint>
+#include <iterator>
 #include <limits>
 
 constexpr int controller_button_count = 15;
@@ -139,3 +141,187 @@ ControllerGamepadRebindingMap::ConsumeRebindEvent(SDL_Event *event)
         return RebindEventResult::Ignore;
     }
 }
+
+#ifdef XEMU_INPUT_UWP
+static int *controller_button_mapping_for_row(ControllerState *state, int row)
+{
+    int *button_map[controller_button_count] = {
+        &state->controller_map->controller_mapping.a,
+        &state->controller_map->controller_mapping.b,
+        &state->controller_map->controller_mapping.x,
+        &state->controller_map->controller_mapping.y,
+        &state->controller_map->controller_mapping.back,
+        &state->controller_map->controller_mapping.guide,
+        &state->controller_map->controller_mapping.start,
+        &state->controller_map->controller_mapping.lstick_btn,
+        &state->controller_map->controller_mapping.rstick_btn,
+        &state->controller_map->controller_mapping.lshoulder,
+        &state->controller_map->controller_mapping.rshoulder,
+        &state->controller_map->controller_mapping.dpad_up,
+        &state->controller_map->controller_mapping.dpad_down,
+        &state->controller_map->controller_mapping.dpad_left,
+        &state->controller_map->controller_mapping.dpad_right,
+    };
+
+    return row >= 0 && row < controller_button_count ? button_map[row] :
+                                                       nullptr;
+}
+
+static int *controller_axis_mapping_for_row(ControllerState *state, int row)
+{
+    int *axis_map[controller_axes_count] = {
+        &state->controller_map->controller_mapping.axis_left_x,
+        &state->controller_map->controller_mapping.axis_left_y,
+        &state->controller_map->controller_mapping.axis_right_x,
+        &state->controller_map->controller_mapping.axis_right_y,
+        &state->controller_map->controller_mapping.axis_trigger_left,
+        &state->controller_map->controller_mapping.axis_trigger_right,
+    };
+    int axis_row = row - controller_button_count;
+
+    return axis_row >= 0 && axis_row < controller_axes_count ?
+               axis_map[axis_row] :
+               nullptr;
+}
+
+static SDL_GamepadButton uwp_button_to_sdl_button(uint16_t button)
+{
+    switch (button) {
+    case XEMU_UWP_GAMEPAD_BUTTON_A:
+        return SDL_GAMEPAD_BUTTON_SOUTH;
+    case XEMU_UWP_GAMEPAD_BUTTON_B:
+        return SDL_GAMEPAD_BUTTON_EAST;
+    case XEMU_UWP_GAMEPAD_BUTTON_X:
+        return SDL_GAMEPAD_BUTTON_WEST;
+    case XEMU_UWP_GAMEPAD_BUTTON_Y:
+        return SDL_GAMEPAD_BUTTON_NORTH;
+    case XEMU_UWP_GAMEPAD_BUTTON_BACK:
+        return SDL_GAMEPAD_BUTTON_BACK;
+    case XEMU_UWP_GAMEPAD_BUTTON_START:
+        return SDL_GAMEPAD_BUTTON_START;
+    case XEMU_UWP_GAMEPAD_BUTTON_LSTICK:
+        return SDL_GAMEPAD_BUTTON_LEFT_STICK;
+    case XEMU_UWP_GAMEPAD_BUTTON_RSTICK:
+        return SDL_GAMEPAD_BUTTON_RIGHT_STICK;
+    case XEMU_UWP_GAMEPAD_BUTTON_WHITE:
+        return SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
+    case XEMU_UWP_GAMEPAD_BUTTON_BLACK:
+        return SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+    case XEMU_UWP_GAMEPAD_BUTTON_DPAD_UP:
+        return SDL_GAMEPAD_BUTTON_DPAD_UP;
+    case XEMU_UWP_GAMEPAD_BUTTON_DPAD_DOWN:
+        return SDL_GAMEPAD_BUTTON_DPAD_DOWN;
+    case XEMU_UWP_GAMEPAD_BUTTON_DPAD_LEFT:
+        return SDL_GAMEPAD_BUTTON_DPAD_LEFT;
+    case XEMU_UWP_GAMEPAD_BUTTON_DPAD_RIGHT:
+        return SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
+    default:
+        return SDL_GAMEPAD_BUTTON_INVALID;
+    }
+}
+
+static bool axis_active(int16_t value)
+{
+    return std::abs((int)value) >
+        (std::numeric_limits<int16_t>::max() >> 1);
+}
+
+ControllerUWPGamepadRebindingMap::ControllerUWPGamepadRebindingMap(
+    int table_row, ControllerState *state)
+    : RebindingMap(table_row), m_state{ state }, m_has_initial_state{ false },
+      m_seen_button{ 0 }
+{
+    if (m_state != nullptr) {
+        m_has_initial_state = xemu_uwp_gamepad_get_state(
+            m_state->uwp_gamepad_index, &m_initial_state);
+    }
+}
+
+RebindEventResult
+ControllerUWPGamepadRebindingMap::ConsumeRebindEvent(SDL_Event *event)
+{
+    (void)event;
+    return RebindEventResult::Ignore;
+}
+
+RebindEventResult ControllerUWPGamepadRebindingMap::Poll()
+{
+    static constexpr uint16_t button_masks[] = {
+        XEMU_UWP_GAMEPAD_BUTTON_A,
+        XEMU_UWP_GAMEPAD_BUTTON_B,
+        XEMU_UWP_GAMEPAD_BUTTON_X,
+        XEMU_UWP_GAMEPAD_BUTTON_Y,
+        XEMU_UWP_GAMEPAD_BUTTON_BACK,
+        XEMU_UWP_GAMEPAD_BUTTON_START,
+        XEMU_UWP_GAMEPAD_BUTTON_LSTICK,
+        XEMU_UWP_GAMEPAD_BUTTON_RSTICK,
+        XEMU_UWP_GAMEPAD_BUTTON_WHITE,
+        XEMU_UWP_GAMEPAD_BUTTON_BLACK,
+        XEMU_UWP_GAMEPAD_BUTTON_DPAD_UP,
+        XEMU_UWP_GAMEPAD_BUTTON_DPAD_DOWN,
+        XEMU_UWP_GAMEPAD_BUTTON_DPAD_LEFT,
+        XEMU_UWP_GAMEPAD_BUTTON_DPAD_RIGHT,
+    };
+    static constexpr SDL_GamepadAxis axis_ids[] = {
+        SDL_GAMEPAD_AXIS_LEFTX,
+        SDL_GAMEPAD_AXIS_LEFTY,
+        SDL_GAMEPAD_AXIS_RIGHTX,
+        SDL_GAMEPAD_AXIS_RIGHTY,
+        SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+        SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
+    };
+    static constexpr int axis_indices[] = { 2, 3, 4, 5, 0, 1 };
+    XemuUWPGamepadState state;
+
+    if (m_state == nullptr || m_state->type != INPUT_DEVICE_UWP_GAMEPAD ||
+        m_state->controller_map == nullptr ||
+        !xemu_uwp_gamepad_get_state(m_state->uwp_gamepad_index, &state)) {
+        return RebindEventResult::Complete;
+    }
+
+    if (m_table_row < controller_button_count) {
+        uint16_t initial_buttons =
+            m_has_initial_state ? m_initial_state.buttons : 0;
+        uint16_t new_buttons = state.buttons & ~initial_buttons;
+
+        if (m_seen_button == 0) {
+            for (uint16_t button : button_masks) {
+                if (new_buttons & button) {
+                    m_seen_button = button;
+                    return RebindEventResult::Ignore;
+                }
+            }
+            return RebindEventResult::Ignore;
+        }
+
+        if (state.buttons & m_seen_button) {
+            return RebindEventResult::Ignore;
+        }
+
+        int *mapping = controller_button_mapping_for_row(m_state, m_table_row);
+        SDL_GamepadButton button = uwp_button_to_sdl_button(m_seen_button);
+        if (mapping != nullptr && button != SDL_GAMEPAD_BUTTON_INVALID) {
+            *mapping = button;
+        }
+        return RebindEventResult::Complete;
+    }
+
+    int *mapping = controller_axis_mapping_for_row(m_state, m_table_row);
+    if (mapping == nullptr) {
+        return RebindEventResult::Complete;
+    }
+
+    for (size_t i = 0; i < std::size(axis_ids); i++) {
+        int axis_index = axis_indices[i];
+        int16_t initial_value =
+            m_has_initial_state ? m_initial_state.axis[axis_index] : 0;
+
+        if (!axis_active(initial_value) && axis_active(state.axis[axis_index])) {
+            *mapping = axis_ids[i];
+            return RebindEventResult::Complete;
+        }
+    }
+
+    return RebindEventResult::Ignore;
+}
+#endif

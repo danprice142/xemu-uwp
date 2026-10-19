@@ -26,6 +26,10 @@ fs = import('fs')
 
 host_os = host_machine.system()
 config_host = keyval.load(meson.current_build_dir() / 'config-host.mak')
+is_uwp = get_option('uwp').enabled()
+if is_uwp and host_os != 'windows'
+  error('UWP builds are only supported on Windows')
+endif
 
 # Temporary directory used for files created while
 # configure runs. Since it is in the build directory
@@ -85,6 +89,21 @@ if host_os == 'darwin' and \
    add_languages('objc', required: true, native: false)
   all_languages += ['objc']
   objc = meson.get_compiler('objc')
+endif
+
+if is_uwp
+  add_project_arguments([
+    '-DXEMU_UWP=1',
+    '-DSDL_PLATFORM_WINRT=1',
+    '-DSDL_WINRT_METADATA_FILE_AVAILABLE=1',
+    '-DWINAPI_FAMILY=WINAPI_FAMILY_APP',
+    '-DWINSTORECOMPAT=1',
+    '-D__WINRT__=1',
+  ], native: false, language: all_languages)
+  add_project_link_arguments([
+    '-lwinstorecompat',
+    '-lwindowsapp',
+  ], native: false, language: all_languages)
 endif
 
 have_rust = add_languages('rust', native: false,
@@ -183,8 +202,16 @@ endforeach
 # xemu Version
 ###########################################
 
-xemu_version_cmd = [find_program('scripts/xemu-version.sh'),
-                    meson.current_source_dir()]
+xemu_version_script = meson.current_source_dir() / 'scripts/xemu-version.sh'
+xemu_version_source_dir = meson.current_source_dir()
+if host_os == 'windows'
+  xemu_version_script = xemu_version_script.replace('\\', '/')
+  xemu_version_source_dir = xemu_version_source_dir.replace('\\', '/')
+  xemu_version_cmd = [sh, xemu_version_script, xemu_version_source_dir]
+else
+  xemu_version_cmd = [find_program('scripts/xemu-version.sh'),
+                      xemu_version_source_dir]
+endif
 xemu_version = custom_target('xemu-version-macro.h',
                              output: 'xemu-version-macro.h',
                              command: xemu_version_cmd,
@@ -732,7 +759,10 @@ hardening_flags = [
 #
 # NB: Clang 17 is broken and SEGVs
 # https://github.com/llvm/llvm-project/issues/75168
-if cc.compiles('extern struct { void (*cb)(void); } s; void f(void) { s.cb(); }',
+#
+# Not for UWP: the console build is CPU-bound in TCG helpers, where the
+# clearing runs on every return.
+if not is_uwp and cc.compiles('extern struct { void (*cb)(void); } s; void f(void) { s.cb(); }',
                name: '-fzero-call-used-regs=used-gpr',
                args: ['-O2', '-fzero-call-used-regs=used-gpr'])
     hardening_flags += '-fzero-call-used-regs=used-gpr'
@@ -1673,10 +1703,14 @@ endif
 
 sdl = not_found
 if not get_option('sdl').auto() or have_system
-  sdl = dependency('sdl3', required: false, allow_fallback: false)
-  if not sdl.found() and not get_option('sdl').disabled()
+  sdl = dependency('sdl3', required: false, allow_fallback: false,
+                   method: is_uwp ? 'pkg-config' : 'auto')
+  if is_uwp and not sdl.found() and not get_option('sdl').disabled()
+    error('UWP builds require an installed SDL3-UWP package. Set PKG_CONFIG_PATH to SDL3-UWP/lib/pkgconfig or use scripts/build-uwp-msys2.sh.')
+  endif
+  if not is_uwp and not sdl.found() and not get_option('sdl').disabled()
     sdl3_cmake_opts = cmake.subproject_options()
-    sdl3_cmake_opts.add_cmake_defines({
+    sdl3_cmake_defines = {
       'SDL_CAMERA': 'OFF',
       'SDL_DISKAUDIO': 'OFF',
       'SDL_DUMMYVIDEO': 'OFF',
@@ -1693,7 +1727,8 @@ if not get_option('sdl').auto() or have_system
       'SDL_TRAY': 'OFF',
       'SDL_VIRTUAL_JOYSTICK': 'OFF',
       'SDL_X11_XTEST': 'OFF',
-    })
+    }
+    sdl3_cmake_opts.add_cmake_defines(sdl3_cmake_defines)
     sdl3_sp = cmake.subproject('sdl3', options: sdl3_cmake_opts, required: get_option('sdl'))
     if sdl3_sp.found()
       sdl = sdl3_sp.dependency('SDL3-static')
@@ -1864,7 +1899,8 @@ if get_option('oss').allowed() and have_system
   endif
 endif
 dsound = not_found
-if not get_option('dsound').auto() or (host_os == 'windows' and have_system)
+if not get_option('dsound').disabled() and \
+    (not get_option('dsound').auto() or (host_os == 'windows' and have_system))
   if cc.has_header('dsound.h')
     dsound = declare_dependency(link_args: ['-lole32', '-ldxguid'])
   endif
@@ -1882,10 +1918,17 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
                          required: get_option('coreaudio'))
 endif
 
-epoxy = dependency('epoxy', required: true)
+epoxy = not_found
+if not get_option('opengl').disabled()
+  epoxy = dependency('epoxy', required: get_option('opengl'))
+endif
 
 opengl = not_found
-if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
+if is_uwp and not get_option('opengl').disabled()
+  error('OpenGL is not supported by the UWP build; pass --disable-opengl')
+endif
+if not get_option('opengl').disabled() and \
+   (not get_option('opengl').auto() or have_system or have_vhost_user_gpu)
   # FIXME: Use meson's 'gl' dep
   if host_os == 'darwin'
     opengl_libs=['-framework', 'OpenGL']
@@ -2387,10 +2430,14 @@ endif
 vulkan = not_found
 libglslang = not_found
 
-if host_os == 'windows'
+if get_option('vulkan').disabled()
+  vulkan = not_found
+elif host_os == 'windows'
   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
 elif host_os == 'linux'
-  vulkan = dependency('vulkan')
+  vulkan = dependency('vulkan', required: get_option('vulkan'))
+elif get_option('vulkan').enabled()
+  error('Vulkan renderer is only supported on Windows and Linux')
 endif
 
 if vulkan.found()
@@ -2428,6 +2475,62 @@ if vulkan.found()
                                      dependencies: vulkan)
 endif
 
+d3d12 = not_found
+if host_os == 'windows'
+  if not get_option('d3d12').disabled()
+    have_d3d12_headers = cc.compiles('''
+      #include <windows.h>
+      #include <dxgi1_6.h>
+      #include <d3d12.h>
+      int main(void) {
+          D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_0 };
+          return sm.HighestShaderModel == D3D_SHADER_MODEL_6_0 ? 0 : 1;
+      }''')
+    if have_d3d12_headers
+      d3d12 = declare_dependency(link_args: [
+        '-ld3d12', '-ldxgi', '-ldxguid', '-ld3dcompiler'
+      ])
+    elif get_option('d3d12').enabled()
+      error('Direct3D 12 shader model query headers not found')
+    endif
+  endif
+elif get_option('d3d12').enabled()
+  error('Direct3D 12 renderer is only supported on Windows')
+endif
+
+ffmpeg = not_found
+if not is_uwp and not get_option('ffmpeg').disabled()
+  ffmpeg_libavcodec = dependency('libavcodec', method: 'pkg-config',
+                                 required: false)
+  ffmpeg_libavformat = dependency('libavformat', method: 'pkg-config',
+                                  required: false)
+  ffmpeg_libavutil = dependency('libavutil', method: 'pkg-config',
+                                required: false)
+  ffmpeg_libswscale = dependency('libswscale', method: 'pkg-config',
+                                 required: false)
+  ffmpeg_found = ffmpeg_libavcodec.found() and ffmpeg_libavformat.found() and ffmpeg_libavutil.found() and ffmpeg_libswscale.found()
+  message('XEMU ffmpeg probe: avcodec=@0@ avformat=@1@ avutil=@2@ swscale=@3@ combined=@4@'.format(ffmpeg_libavcodec.found(), ffmpeg_libavformat.found(), ffmpeg_libavutil.found(), ffmpeg_libswscale.found(), ffmpeg_found))
+  if ffmpeg_found
+    ffmpeg = declare_dependency(dependencies: [
+      ffmpeg_libavcodec, ffmpeg_libavformat, ffmpeg_libavutil,
+      ffmpeg_libswscale])
+  elif get_option('ffmpeg').enabled()
+    error('ffmpeg (libavcodec/libavformat/libavutil/libswscale) not found')
+  endif
+endif
+
+uwp_media_stream = not_found
+if is_uwp
+  uwp_media_stream = declare_dependency(dependencies: [
+    cc.find_library('mfplat', required: true),
+    cc.find_library('mfreadwrite', required: true),
+    cc.find_library('mfuuid', required: true),
+    cc.find_library('wmcodecdspuuid', required: true),
+    cc.find_library('ole32', required: true),
+    cc.find_library('ws2_32', required: true),
+  ])
+endif
+
 if host_os == 'windows'
   libpcap = declare_dependency(include_directories: 'winpcap-loader/include',
                                link_args: ['-lws2_32'])
@@ -2437,15 +2540,24 @@ endif
 
 libsamplerate = dependency('samplerate', method: 'pkg-config', required: true)
 
+imgui_dx12_option = 'dx12=disabled'
+if d3d12.found()
+  imgui_dx12_option = 'dx12=enabled'
+endif
+imgui_opengl_option = 'opengl=disabled'
+if opengl.found()
+  imgui_opengl_option = 'opengl=enabled'
+endif
+
 imgui_proj = subproject('imgui', required: true,
                          default_options: [
                            'default_library=static',
                            'dx9=disabled',
                            'dx10=disabled',
                            'dx11=disabled',
-                           'dx12=disabled',
+                           imgui_dx12_option,
                            'metal=disabled',
-                           'opengl=enabled',
+                           imgui_opengl_option,
                            'sdl2_renderer=disabled',
                            'sdl3_renderer=disabled',
                            'vulkan=disabled',
@@ -2698,6 +2810,9 @@ if numa.found()
 endif
 config_host_data.set('CONFIG_OPENGL', opengl.found())
 config_host_data.set('CONFIG_VULKAN', vulkan.found())
+config_host_data.set('CONFIG_D3D12', d3d12.found())
+config_host_data.set('CONFIG_FFMPEG', ffmpeg.found())
+config_host_data.set('CONFIG_UWP', is_uwp)
 config_host_data.set('CONFIG_PLUGIN', get_option('plugins'))
 config_host_data.set('CONFIG_RBD', rbd.found())
 config_host_data.set('CONFIG_RDMA', rdma.found())
@@ -3767,6 +3882,18 @@ xemu_config = custom_target('xemu-config.h',
                             command : [python, genconfig_proj.get_variable('gen_config_script_path'), '@INPUT@', '@OUTPUT@'],
                             )
 
+if is_uwp
+  screenscraper_build_secrets = custom_target(
+    'screenscraper-build-secrets.h',
+    output: 'screenscraper-build-secrets.h',
+    input: files('scripts/generate-screenscraper-build-secrets.py'),
+    command: [python, '@INPUT@', '@OUTPUT@'],
+    build_by_default: true,
+    build_always_stale: true,
+  )
+  genh += screenscraper_build_secrets
+endif
+
 genh += qemu_version
 genh += xemu_version
 genh += xemu_config
@@ -3965,7 +4092,9 @@ subdir('crypto')
 subdir('ui')
 subdir('gdbstub')
 subdir('data')
-subdir('winpcap-loader')
+if not is_uwp
+  subdir('winpcap-loader')
+endif
 
 if have_system
   subdir('hw')
@@ -5172,6 +5301,7 @@ summary_info += {'libusb':            libusb}
 summary_info += {'usb net redir':     usbredir}
 summary_info += {'OpenGL support (epoxy)': opengl}
 summary_info += {'Vulkan support':    vulkan}
+summary_info += {'Direct3D 12 support': d3d12}
 summary_info += {'GBM':               gbm}
 summary_info += {'libiscsi support':  libiscsi}
 summary_info += {'libnfs support':    libnfs}

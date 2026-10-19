@@ -19,6 +19,13 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef _WIN32
+#include "accel/tcg/xbox-fastmem.h"
+#include "exec/cputlb.h"
+#include "system/tcg.h"
+#include "migration/vmstate.h"
+#include "cpu.h"
+#endif
 #include "qemu/option.h"
 #include "qemu/datadir.h"
 #include "hw/hw.h"
@@ -60,11 +67,26 @@
 
 #define MAX_IDE_BUS 2
 
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+#define XBOX_UWP_TRACE(step) \
+    fprintf(stderr, "xemu UWP: xbox_init_common " step "\n")
+#define XBOX_UWP_FLASH_TRACE(step) \
+    fprintf(stderr, "xemu UWP: xbox_flash_init " step "\n")
+#define XBOX_UWP_MEMORY_TRACE(step) \
+    fprintf(stderr, "xemu UWP: xbox_memory_init " step "\n")
+#else
+#define XBOX_UWP_TRACE(step) do { } while (0)
+#define XBOX_UWP_FLASH_TRACE(step) do { } while (0)
+#define XBOX_UWP_MEMORY_TRACE(step) do { } while (0)
+#endif
+
 /* FIXME: Clean this up and propagate errors to UI */
 static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
 {
     const uint32_t rom_start = 0xFF000000;
     const char *bios_name;
+
+    XBOX_UWP_FLASH_TRACE("locating BIOS image");
 
     /* Locate BIOS ROM image */
     bios_name = ms->firmware ?: "bios.bin";
@@ -81,10 +103,12 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
         }
     }
 
+    XBOX_UWP_FLASH_TRACE("allocating BIOS buffer");
     char *bios_data = g_malloc(bios_size);
     assert(bios_data != NULL);
 
     if (!failed_to_load_bios && (filename != NULL)) {
+        XBOX_UWP_FLASH_TRACE("reading BIOS image");
         /* Read BIOS ROM into memory */
         failed_to_load_bios = 1;
         int fd = qemu_open(filename, O_RDONLY | O_BINARY, NULL);
@@ -106,6 +130,7 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
     }
 
     /* Create BIOS region */
+    XBOX_UWP_FLASH_TRACE("creating BIOS ROM region");
     MemoryRegion *bios;
     bios = g_malloc(sizeof(*bios));
     assert(bios != NULL);
@@ -113,6 +138,7 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
     rom_add_blob_fixed("xbox.bios", bios_data, bios_size, rom_start);
 
     /* Mirror ROM from 0xff000000 - 0xffffffff */
+    XBOX_UWP_FLASH_TRACE("mapping BIOS ROM mirrors");
     uint32_t map_loc;
     for (map_loc = rom_start; map_loc >= rom_start; map_loc += bios_size) {
         MemoryRegion *map_bios = g_malloc(sizeof(*map_bios));
@@ -144,6 +170,7 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
         object_property_get_str(qdev_get_machine(), "bootrom", NULL);
 
     if ((bootrom_file != NULL) && *bootrom_file) {
+        XBOX_UWP_FLASH_TRACE("locating MCPX boot ROM");
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bootrom_file);
         assert(filename);
 
@@ -156,6 +183,7 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
         }
 
         /* Read in MCPX ROM over last 512 bytes of BIOS data */
+        XBOX_UWP_FLASH_TRACE("reading MCPX boot ROM");
         int fd = qemu_open(filename, O_RDONLY | O_BINARY, NULL);
         assert(fd >= 0);
         int rc = read(fd, bios_data + bios_size - bootrom_size, bootrom_size);
@@ -165,12 +193,14 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
     }
 
     // Leave last BIOS image overlay writeable to satisfy cache dependency
+    XBOX_UWP_FLASH_TRACE("creating MCPX overlay RAM");
     MemoryRegion *mcpx = g_malloc(sizeof(MemoryRegion));
     memory_region_init_ram(mcpx, NULL, "xbox.mcpx", bios_size, &error_fatal);
     rom_add_blob_fixed("xbox.mcpx", bios_data, bios_size, -bios_size);
     memory_region_add_subregion_overlap(rom_memory, -bios_size, mcpx, 1);
 
     g_free(bios_data); /* duplicated by `rom_add_blob_fixed` */
+    XBOX_UWP_FLASH_TRACE("finished");
 }
 
 static void xbox_memory_init(PCMachineState *pcms,
@@ -190,15 +220,41 @@ static void xbox_memory_init(PCMachineState *pcms,
      * aliases to address portions of it, mostly for backwards compatibility
      * with older qemus that used qemu_ram_alloc().
      */
+    XBOX_UWP_MEMORY_TRACE("allocating guest RAM");
     ram = g_malloc(sizeof(*ram));
+#ifdef _WIN32
+    {
+        /* Section-backed RAM lets the vCPU mirror guest pages directly. */
+        void *direct = xbox_fastmem_alloc_ram(machine->ram_size);
+
+        if (direct != NULL) {
+            memory_region_init_ram_ptr(ram, NULL, "xbox.ram",
+                                       machine->ram_size, direct);
+            vmstate_register_ram_global(ram);
+            xbox_fastmem_set_ram(direct, machine->ram_size,
+                                 MMU_KNOSMAP32_IDX);
+        } else {
+            memory_region_init_ram(ram, NULL, "xbox.ram",
+                                   machine->ram_size, &error_fatal);
+        }
+    }
+#else
     memory_region_init_ram(ram, NULL, "xbox.ram",
                            machine->ram_size, &error_fatal);
+#endif
 
     *ram_memory = ram;
     memory_region_add_subregion(system_memory, 0, ram);
+    if (tcg_enabled()) {
+        tlb_set_dirty_filter_ram(memory_region_get_ram_ptr(ram),
+                                 machine->ram_size);
+    }
 
+    XBOX_UWP_MEMORY_TRACE("initializing flash and boot ROM");
     xbox_flash_init(machine, rom_memory);
+    XBOX_UWP_MEMORY_TRACE("cleaning unused PC system flash");
     pc_system_flash_cleanup_unused(pcms);
+    XBOX_UWP_MEMORY_TRACE("finished");
 }
 
 /* PC hardware initialisation */
@@ -240,12 +296,17 @@ void xbox_init_common(MachineState *machine,
     I2CBus *smbus;
     PCIBus *agp_bus;
 
+    XBOX_UWP_TRACE("entering x86 CPU init");
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
+    XBOX_UWP_TRACE("finished x86 CPU init");
 
     if (kvm_enabled()) {
+        XBOX_UWP_TRACE("creating KVM clock");
         kvmclock_create(pcmc->kvmclock_create_always);
+        XBOX_UWP_TRACE("finished KVM clock");
     }
 
+    XBOX_UWP_TRACE("creating PCI memory region");
     pci_memory = g_new(MemoryRegion, 1);
     memory_region_init(pci_memory, NULL, "pci", UINT64_MAX);
     rom_memory = pci_memory;
@@ -253,10 +314,15 @@ void xbox_init_common(MachineState *machine,
     // pc_guest_info_init(pcms);
 
     /* allocate ram and load rom/bios */
+    XBOX_UWP_TRACE("entering Xbox RAM/flash init");
     xbox_memory_init(pcms, system_memory, rom_memory, &ram_memory);
+    XBOX_UWP_TRACE("finished Xbox RAM/flash init");
 
+    XBOX_UWP_TRACE("creating GSI/interrupt controller state");
     gsi_state = pc_gsi_create(&x86ms->gsi, pcmc->pci_enabled);
+    XBOX_UWP_TRACE("finished GSI/interrupt controller state");
 
+    XBOX_UWP_TRACE("creating Xbox PCI/ISA/SMBus/AGP host");
     xbox_pci_init(x86ms->gsi,
                   get_system_memory(), get_system_io(),
                   pci_memory, ram_memory, rom_memory,
@@ -264,80 +330,123 @@ void xbox_init_common(MachineState *machine,
                   &isa_bus,
                   &smbus,
                   &agp_bus);
+    XBOX_UWP_TRACE("finished Xbox PCI/ISA/SMBus/AGP host");
 
     pcms->pcibus = pci_bus;
 
+    XBOX_UWP_TRACE("registering ISA input IRQs");
     isa_bus_register_input_irqs(isa_bus, x86ms->gsi);
+    XBOX_UWP_TRACE("finished ISA input IRQ registration");
 
+    XBOX_UWP_TRACE("creating PIC");
     pc_i8259_create(isa_bus, gsi_state->i8259_irq);
+    XBOX_UWP_TRACE("finished PIC");
 
     if (tcg_enabled()) {
+        XBOX_UWP_TRACE("registering FERR IRQ");
         x86_register_ferr_irq(x86ms->gsi[13]);
+        XBOX_UWP_TRACE("finished FERR IRQ registration");
     }
 
     /* init basic PC hardware */
+    XBOX_UWP_TRACE("creating RTC");
     rtc_state = mc146818_rtc_init(isa_bus, 2000, NULL);
     x86ms->rtc = ISA_DEVICE(rtc_state);
+    XBOX_UWP_TRACE("finished RTC");
 
     if (kvm_pit_in_kernel()) {
+        XBOX_UWP_TRACE("creating KVM PIT");
         pit = kvm_pit_init(isa_bus, 0x40);
+        XBOX_UWP_TRACE("finished KVM PIT");
     } else {
+        XBOX_UWP_TRACE("creating i8254 PIT");
         pit = i8254_pit_init(isa_bus, 0x40, pit_isa_irq, pit_alt_irq);
+        XBOX_UWP_TRACE("finished i8254 PIT");
     }
 
+    XBOX_UWP_TRACE("creating i8257 DMA controller");
     i8257_dma_init(OBJECT(machine), isa_bus, 0);
+    XBOX_UWP_TRACE("finished i8257 DMA controller");
 
+    XBOX_UWP_TRACE("realizing PC speaker");
     object_property_set_link(OBJECT(pcms->pcspk), "pit",
                              OBJECT(pit), &error_fatal);
     isa_realize_and_unref(pcms->pcspk, isa_bus, &error_fatal);
+    XBOX_UWP_TRACE("finished PC speaker");
 
+    XBOX_UWP_TRACE("creating PIIX3 IDE controller");
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
     pci_ide_create_devs(dev);
+    XBOX_UWP_TRACE("finished PIIX3 IDE controller and drives");
     // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
     // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 
     /* smbus devices */
+    XBOX_UWP_TRACE("creating Xbox SMC SMBus device");
     smbus_xbox_smc_init(smbus, 0x10);
+    XBOX_UWP_TRACE("finished Xbox SMC SMBus device");
 
     const char *video_encoder =
         object_property_get_str(qdev_get_machine(), "video-encoder", NULL);
 
     if (strcmp(video_encoder, "xcalibur") != 0) {
         if (!strcmp(video_encoder, "conexant")) {
+            XBOX_UWP_TRACE("creating Conexant video encoder SMBus device");
             smbus_cx25871_init(smbus, 0x45);
+            XBOX_UWP_TRACE("finished Conexant video encoder SMBus device");
         } else if (!strcmp(video_encoder, "focus")) {
+            XBOX_UWP_TRACE("creating Focus video encoder SMBus device");
             smbus_fs454_init(smbus, 0x6A);
+            XBOX_UWP_TRACE("finished Focus video encoder SMBus device");
         }
+        XBOX_UWP_TRACE("creating ADM1032 thermal monitor SMBus device");
         smbus_adm1032_init(smbus, 0x4C);
+        XBOX_UWP_TRACE("finished ADM1032 thermal monitor SMBus device");
     } else {
+        XBOX_UWP_TRACE("creating Xcalibur video encoder SMBus device");
         smbus_xcalibur_init(smbus, 0x70);
+        XBOX_UWP_TRACE("finished Xcalibur video encoder SMBus device");
     }
 
     /* USB */
+    XBOX_UWP_TRACE("realizing OHCI USB controller at PCI 3:0");
     PCIDevice *usb1 = pci_new(PCI_DEVFN(3, 0), "pci-ohci");
     qdev_prop_set_uint32(&usb1->qdev, "num-ports", 4);
     pci_realize_and_unref(usb1, pci_bus, &error_fatal);
+    XBOX_UWP_TRACE("finished OHCI USB controller at PCI 3:0");
 
+    XBOX_UWP_TRACE("realizing OHCI USB controller at PCI 2:0");
     PCIDevice *usb0 = pci_new(PCI_DEVFN(2, 0), "pci-ohci");
     qdev_prop_set_uint32(&usb0->qdev, "num-ports", 4);
     pci_realize_and_unref(usb0, pci_bus, &error_fatal);
+    XBOX_UWP_TRACE("finished OHCI USB controller at PCI 2:0");
 
     /* Ethernet! */
+    XBOX_UWP_TRACE("realizing NVNet ethernet device");
     PCIDevice *nvnet = pci_new(PCI_DEVFN(4, 0), "nvnet");
     qemu_configure_nic_device(DEVICE(nvnet), true, "nvnet");
     pci_realize_and_unref(nvnet, pci_bus, &error_fatal);
+    XBOX_UWP_TRACE("finished NVNet ethernet device");
 
     /* APU! */
+    XBOX_UWP_TRACE("realizing MCPX APU audio device");
     mcpx_apu_init(pci_bus, PCI_DEVFN(5, 0), ram_memory);
+    XBOX_UWP_TRACE("finished MCPX APU audio device");
 
     /* ACI! */
+    XBOX_UWP_TRACE("realizing MCPX ACI audio codec interface");
     pci_create_simple(pci_bus, PCI_DEVFN(6, 0), "mcpx-aci");
+    XBOX_UWP_TRACE("finished MCPX ACI audio codec interface");
 
     /* GPU! */
+    XBOX_UWP_TRACE("realizing NV2A GPU device");
     nv2a_init(agp_bus, PCI_DEVFN(0, 0), ram_memory);
+    XBOX_UWP_TRACE("finished NV2A GPU device");
 
     /* FIXME: Stub the memory controller */
+    XBOX_UWP_TRACE("creating PCI memory controller stub");
     pci_create_simple(pci_bus, PCI_DEVFN(0, 3), "pci-testdev");
+    XBOX_UWP_TRACE("finished PCI memory controller stub");
 
     if (pci_bus_out) {
         *pci_bus_out = pci_bus;
@@ -345,6 +454,7 @@ void xbox_init_common(MachineState *machine,
     if (isa_bus_out) {
         *isa_bus_out = isa_bus;
     }
+    XBOX_UWP_TRACE("finished");
 }
 
 static char *machine_get_bootrom(Object *obj, Error **errp)

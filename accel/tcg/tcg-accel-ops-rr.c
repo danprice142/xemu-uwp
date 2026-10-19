@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/cpus.h"
 #include "qemu/lockable.h"
 #include "system/tcg.h"
 #include "system/replay.h"
@@ -282,11 +283,19 @@ static void *rr_cpu_thread_fn(void *arg)
                 if (icount_enabled()) {
                     icount_prepare_for_run(cpu, cpu_budget);
                 }
-                r = tcg_cpu_exec(cpu);
-                if (icount_enabled()) {
-                    icount_process_data(cpu);
+                {
+                    int64_t exec_start = g_get_monotonic_time();
+                    int64_t lock_start;
+
+                    r = tcg_cpu_exec(cpu);
+                    if (icount_enabled()) {
+                        icount_process_data(cpu);
+                    }
+                    lock_start = g_get_monotonic_time();
+                    qemu_vcpu_exec_us += lock_start - exec_start;
+                    bql_lock();
+                    qemu_vcpu_bql_us += g_get_monotonic_time() - lock_start;
                 }
-                bql_lock();
 
                 if (r == EXCP_DEBUG) {
                     cpu_handle_guest_debug(cpu);

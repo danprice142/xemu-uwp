@@ -543,6 +543,11 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
     PGRAPHVkState *r = d->pgraph.vk_renderer_state;
     bool wait_for_downloads = false;
 
+    if (r == NULL) {
+        qemu_mutex_unlock(&d->pgraph.lock);
+        return;
+    }
+
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         if (!check_surface_overlaps_range(surface, addr, len)) {
@@ -689,9 +694,8 @@ static void surface_put(NV2AState *d, SurfaceBinding *surface)
     assert(pgraph_vk_surface_get(d, surface->vram_addr) == NULL);
 
     invalidate_overlapping_surfaces(d, surface);
-    register_cpu_access_callback(d, surface);
-
     QTAILQ_INSERT_HEAD(&r->surfaces, surface, entry);
+    register_cpu_access_callback(d, surface);
 }
 
 SurfaceBinding *pgraph_vk_surface_get(NV2AState *d, hwaddr addr)

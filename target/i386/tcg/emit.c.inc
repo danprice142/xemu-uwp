@@ -558,9 +558,88 @@ static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
         fn(tcg_env, OP_PTR0, OP_PTR2);
     }
 }
-#define UNARY_FP_SSE(uname, lname)                                                 \
+#ifdef XBOX
+/*
+ * Legacy-encoded single precision SSE arithmetic (0F @opb: packed,
+ * F3 0F @opb: scalar) as one host instruction on the env register file.
+ * Only with MXCSR at the host default, where the results are identical;
+ * the guest MXCSR exception flags are not updated on this path.
+ */
+static bool gen_sse_native_op(DisasContext *s, X86DecodedInsn *decode,
+                              unsigned opb, bool arith)
+{
+    bool scalar = s->prefix & PREFIX_REPZ;
+
+    if (opb == 0 || !qatomic_read(&xbox_sse_native) ||
+        (s->prefix & PREFIX_VEX) ||
+        (s->prefix & (PREFIX_DATA | PREFIX_REPNZ)) ||
+        decode->op[0].unit != X86_OP_SSE ||
+        decode->op[1].offset != decode->op[0].offset) {
+        return false;
+    }
+    if (arith) {
+        if (!g_use_hard_fpu || !(s->flags & HF_SSE_DEFAULT_MASK)) {
+            return false;
+        }
+        /* x87 code may have left the guest rounding mode in MXCSR. */
+        if (s->flcr_set) {
+            tcg_gen_flcr(tcg_constant_i32(0x1f80));
+            s->flcr_set = false;
+        }
+    }
+    tcg_gen_xbox_sse(opb, scalar, decode->op[0].offset, decode->op[2].offset);
+    return true;
+}
+
+static bool gen_sse_native(DisasContext *s, X86DecodedInsn *decode,
+                           unsigned opb)
+{
+    return gen_sse_native_op(s, decode, opb, true);
+}
+
+/*
+ * COMISS/UCOMISS: the host COMISS sets ZF, PF and CF exactly as the
+ * guest instruction does (they differ only in exception signalling).
+ */
+static bool gen_sse_native_comi(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i32 a, b;
+    TCGv_f32 fa, fb;
+    TCGv_i64 flags;
+
+    if (!qatomic_read(&xbox_sse_native) || !g_use_hard_fpu ||
+        !(s->flags & HF_SSE_DEFAULT_MASK) ||
+        (s->prefix & (PREFIX_VEX | PREFIX_DATA))) {
+        return false;
+    }
+    a = tcg_temp_new_i32();
+    b = tcg_temp_new_i32();
+    fa = tcg_temp_new_f32();
+    fb = tcg_temp_new_f32();
+    flags = tcg_temp_new_i64();
+    tcg_gen_ld_i32(a, tcg_env,
+                   decode->op[1].offset + offsetof(ZMMReg, ZMM_S(0)));
+    tcg_gen_ld_i32(b, tcg_env,
+                   decode->op[2].offset + offsetof(ZMMReg, ZMM_S(0)));
+    tcg_gen_mov32i_f32(fa, a);
+    tcg_gen_mov32i_f32(fb, b);
+    tcg_gen_com_f32(flags, fa, fb);
+    tcg_gen_andi_i64(flags, flags, CC_Z | CC_P | CC_C);
+    tcg_gen_extrl_i64_i32(cpu_cc_src, flags);
+    set_cc_op(s, CC_OP_EFLAGS);
+    return true;
+}
+#define SSE_NATIVE(s, decode, opb) gen_sse_native(s, decode, opb)
+#else
+#define SSE_NATIVE(s, decode, opb) false
+#endif
+
+#define UNARY_FP_SSE(uname, lname, opb)                                            \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
+    if (SSE_NATIVE(s, decode, opb)) {                                              \
+        return;                                                                    \
+    }                                                                              \
     gen_unary_fp_sse(s, decode,                                                    \
                      gen_helper_##lname##pd_xmm,                                   \
                      gen_helper_##lname##ps_xmm,                                   \
@@ -569,7 +648,7 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                      gen_helper_##lname##sd,                                       \
                      gen_helper_##lname##ss);                                      \
 }
-UNARY_FP_SSE(VSQRT, sqrt)
+UNARY_FP_SSE(VSQRT, sqrt, 0x51)
 
 /*
  * 00 = v*ps Vps, Hps, Wpd
@@ -597,9 +676,12 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
-#define FP_SSE(uname, lname)                                                       \
+#define FP_SSE(uname, lname, opb)                                                  \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
+    if (SSE_NATIVE(s, decode, opb)) {                                              \
+        return;                                                                    \
+    }                                                                              \
     gen_fp_sse(s, decode,                                                          \
                gen_helper_##lname##pd_xmm,                                         \
                gen_helper_##lname##ps_xmm,                                         \
@@ -608,12 +690,12 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                gen_helper_##lname##sd,                                             \
                gen_helper_##lname##ss);                                            \
 }
-FP_SSE(VADD, add)
-FP_SSE(VMUL, mul)
-FP_SSE(VSUB, sub)
-FP_SSE(VMIN, min)
-FP_SSE(VDIV, div)
-FP_SSE(VMAX, max)
+FP_SSE(VADD, add, 0x58)
+FP_SSE(VMUL, mul, 0x59)
+FP_SSE(VSUB, sub, 0x5c)
+FP_SSE(VMIN, min, 0x5d)
+FP_SSE(VDIV, div, 0x5e)
+FP_SSE(VMAX, max, 0x5f)
 
 #define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \
 static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)               \
@@ -2029,6 +2111,8 @@ static void gen_FXRSTOR(DisasContext *s, X86DecodedInsn *decode)
         gen_NM_exception(s);
     } else {
         gen_helper_fxrstor(tcg_env, s->A0);
+        /* The restored control word changes HF_FPU_PC. */
+        s->base.is_jmp = DISAS_EOB_NEXT;
     }
 }
 
@@ -2371,6 +2455,10 @@ static void gen_LDMXCSR(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_trunc_tl_i32(tmp, s->T0);
     gen_helper_ldmxcsr(tcg_env, tmp);
+#ifdef XBOX
+    /* The new controls may change HF_SSE_DEFAULT. */
+    s->base.is_jmp = DISAS_EOB_NEXT;
+#endif
 }
 
 static void gen_lxx_seg(DisasContext *s, X86DecodedInsn *decode, int seg)
@@ -4273,6 +4361,11 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
     SSEFunc_0_epp fn;
+#ifdef XBOX
+    if (gen_sse_native_comi(s, decode)) {
+        return;
+    }
+#endif
     fn = s->prefix & PREFIX_DATA ? gen_helper_comisd : gen_helper_comiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
     assume_cc_op(s, CC_OP_EFLAGS);
@@ -4659,6 +4752,12 @@ static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant_i32(decode->immediate);
     SSEFunc_0_pppi ps, pd, fn;
+#ifdef XBOX
+    if (gen_sse_native_op(s, decode,
+                          0xc6 | TCG_XBOX_SSE_IMM8(decode->immediate), false)) {
+        return;
+    }
+#endif
     ps = s->vex_l ? gen_helper_shufps_ymm : gen_helper_shufps_xmm;
     pd = s->vex_l ? gen_helper_shufpd_ymm : gen_helper_shufpd_xmm;
     fn = s->prefix & PREFIX_DATA ? pd : ps;
@@ -4668,6 +4767,11 @@ static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VUCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
     SSEFunc_0_epp fn;
+#ifdef XBOX
+    if (gen_sse_native_comi(s, decode)) {
+        return;
+    }
+#endif
     fn = s->prefix & PREFIX_DATA ? gen_helper_ucomisd : gen_helper_ucomiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
     assume_cc_op(s, CC_OP_EFLAGS);
@@ -4798,13 +4902,11 @@ static void gen_XRSTOR(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
     gen_helper_xrstor(tcg_env, s->A0, features);
-    if (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_MPX) {
-        /*
-         * XRSTOR is how MPX is enabled, which changes how
-         * we translate.  Thus we need to end the TB.
-         */
-        s->base.is_jmp = DISAS_EOB_NEXT;
-    }
+    /*
+     * XRSTOR is how MPX is enabled, and a restored x87 control word
+     * changes HF_FPU_PC; both affect translation, so end the TB.
+     */
+    s->base.is_jmp = DISAS_EOB_NEXT;
 }
 
 static void gen_XSAVE(DisasContext *s, X86DecodedInsn *decode)

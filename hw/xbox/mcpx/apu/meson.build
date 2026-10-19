@@ -4,5 +4,9 @@ mcpx_ss.add(sdl, files(
 	'monitor.c',
 	))
 
+if is_uwp
+	mcpx_ss.add(cc.find_library('xaudio2_9', required: true))
+endif
+
 subdir('vp')
 subdir('dsp')

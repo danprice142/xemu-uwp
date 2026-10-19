@@ -1,5 +1,6 @@
 /GNUmakefile
 /build/
+/build-*/
 /.cache/
 /.vscode/
 *.pyc
@@ -22,7 +23,19 @@ GTAGS
 
 build.log
 /dist
+/dist-*/
 /xemu.ini
 /macos-libs/
 /macos-pkgs/
 /xemu.iconset/
+
+# Local UWP/Xbox test and loose deployment artifacts
+/test-output/
+/packages.json
+/xemu-loose-layout/
+/xemu.uwp.dev-CLEAN-DEPLOY/
+xbox-corrupted-frame.wpix
+
+# Generated private build credentials (including interrupted atomic writes)
+screenscraper-build-secrets.h*
+.screenscraper-build-secrets.h.*.tmp

@@ -19,12 +19,15 @@
 #pragma once
 #include <stdint.h>
 #include <deque>
+#include <mutex>
 
 #include "../xemu-notifications.h"
 
 class NotificationManager
 {
 private:
+    /* Messages are queued from emulation and worker threads too. */
+    std::mutex m_queue_lock;
     std::deque<const char *> m_notification_queue;
     std::deque<const char *> m_error_queue;
 

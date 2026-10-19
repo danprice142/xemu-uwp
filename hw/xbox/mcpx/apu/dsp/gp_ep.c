@@ -70,7 +70,35 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
             bytes_to_copy = len;
         }
 
-        assert(paddr + bytes_to_copy < memory_region_size(d->ram));
+        uint64_t ram_size = memory_region_size(d->ram);
+
+        if (paddr >= ram_size || bytes_to_copy > ram_size - paddr) {
+            /*
+             * An out-of-range scatter-gather entry must not abort the
+             * machine: hardware would access the wrong pages and the
+             * title would keep running.  Drop the rest of the transfer.
+             */
+            static unsigned int reports;
+            unsigned int report = qatomic_fetch_inc(&reports);
+
+            if (report < 16) {
+                uint32_t prd_control = ldl_le_phys(
+                    &address_space_memory,
+                    sge_base + page_entry * 8 + 4);
+                fprintf(stderr,
+                        "mcpx apu: dropping out-of-range DSP %s DMA "
+                        "paddr=0x%" HWADDR_PRIx " len=%u sge_base=0x%"
+                        HWADDR_PRIx " page=%u prd=0x%08x ctl=0x%08x "
+                        "(ram=%" PRIu64 " bytes)\n",
+                        dir ? "write" : "read", paddr, bytes_to_copy,
+                        sge_base, page_entry, prd_address, prd_control,
+                        (uint64_t)memory_region_size(d->ram));
+            }
+            if (!dir) {
+                memset(ptr, 0, len);
+            }
+            return;
+        }
 
         if (dir) {
             memcpy(&d->ram_ptr[paddr], ptr, bytes_to_copy);

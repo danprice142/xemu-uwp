@@ -60,8 +60,20 @@ static void qmp_chardev_open_file(Chardev *chr,
         flags = CREATE_ALWAYS;
     }
 
+#ifdef CONFIG_UWP
+    wchar_t *wout = g_utf8_to_utf16(file->out, -1, NULL, NULL, NULL);
+    if (!wout) {
+        error_setg(errp, "open %s failed: could not convert path to UTF-16",
+                   file->out);
+        return;
+    }
+    out = CreateFileW(wout, accessmode, FILE_SHARE_READ, NULL, flags,
+                      FILE_ATTRIBUTE_NORMAL, NULL);
+    g_free(wout);
+#else
     out = CreateFile(file->out, accessmode, FILE_SHARE_READ, NULL, flags,
                      FILE_ATTRIBUTE_NORMAL, NULL);
+#endif
     if (out == INVALID_HANDLE_VALUE) {
         error_setg(errp, "open %s failed", file->out);
         return;

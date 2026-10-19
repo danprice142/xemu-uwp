@@ -51,6 +51,25 @@ static int virt_to_phys(vaddr vaddr, hwaddr *phys_addr)
     return 0;
 }
 
+static MemTxAttrs xemu_debug_memattrs(void)
+{
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    attrs.debug = true;
+    return attrs;
+}
+
+static bool phys_debug_ldl_le(hwaddr phys_addr, uint32_t *value)
+{
+    uint8_t data[sizeof(*value)];
+
+    if (dma_memory_read(&address_space_memory, phys_addr, data, sizeof(data),
+                        xemu_debug_memattrs()) != MEMTX_OK) {
+        return false;
+    }
+    *value = ldl_le_p(data);
+    return true;
+}
+
 static ssize_t virt_dma_memory_read(vaddr vaddr, void *buf, size_t len)
 {
     size_t num_bytes_read = 0;
@@ -66,12 +85,11 @@ static ssize_t virt_dma_memory_read(vaddr vaddr, void *buf, size_t len)
         size_t bytes_remaining_in_page = TARGET_PAGE_SIZE - (phys_addr & ~TARGET_PAGE_MASK);
         size_t num_bytes_to_read = MIN(len - num_bytes_read, bytes_remaining_in_page);
 
-        // FIXME: Check return value
-        dma_memory_read(&address_space_memory,
-                        phys_addr,
-                        buf + num_bytes_read,
-                        num_bytes_to_read,
-                        MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_read(&address_space_memory, phys_addr,
+                            buf + num_bytes_read, num_bytes_to_read,
+                            xemu_debug_memattrs()) != MEMTX_OK) {
+            return -1;
+        }
 
         num_bytes_read += num_bytes_to_read;
     }
@@ -97,14 +115,17 @@ struct xbe *xemu_get_xbe_info(void)
     }
 
     // Check `XBEH` signature
-    uint32_t sig = ldl_le_phys(&address_space_memory, hdr_addr_phys);
-    if (sig != 0x48454258) {
+    uint32_t sig;
+    if (!phys_debug_ldl_le(hdr_addr_phys, &sig) || sig != 0x48454258) {
         return NULL;
     }
 
     // Determine full length of headers
-    xbe.headers_len = ldl_le_phys(&address_space_memory,
-        hdr_addr_phys + offsetof(struct xbe_header, m_sizeof_headers));
+    if (!phys_debug_ldl_le(
+            hdr_addr_phys + offsetof(struct xbe_header, m_sizeof_headers),
+            &xbe.headers_len)) {
+        return NULL;
+    }
     if (xbe.headers_len > 8*TARGET_PAGE_SIZE) {
         // Headers are unusually large
         return NULL;

@@ -916,14 +916,23 @@ void *qemu_win32_map_alloc(size_t size, HANDLE *h, Error **errp)
 
     trace_win32_map_alloc(size);
 
+#ifdef CONFIG_UWP
+    *h = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                  size, NULL);
+#else
     *h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
-                          size, NULL);
+                           size, NULL);
+#endif
     if (*h == NULL) {
         error_setg_win32(errp, GetLastError(), "Failed to CreateFileMapping");
         return NULL;
     }
 
+#ifdef CONFIG_UWP
+    bits = MapViewOfFileFromApp(*h, FILE_MAP_ALL_ACCESS, 0, size);
+#else
     bits = MapViewOfFile(*h, FILE_MAP_ALL_ACCESS, 0, 0, size);
+#endif
     if (bits == NULL) {
         error_setg_win32(errp, GetLastError(), "Failed to MapViewOfFile");
         CloseHandle(*h);

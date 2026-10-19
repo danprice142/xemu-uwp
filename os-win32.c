@@ -28,6 +28,7 @@
 #include <mmsystem.h>
 #include "system/runstate.h"
 
+#ifndef CONFIG_UWP
 static BOOL WINAPI qemu_ctrl_handler(DWORD type)
 {
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_SIGNAL);
@@ -46,13 +47,53 @@ static void os_undo_timer_resolution(void)
 {
     timeEndPeriod(mm_tc.wPeriodMin);
 }
+#endif
 
 void os_setup_early_signal_handling(void)
 {
+#ifndef CONFIG_UWP
     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
     timeBeginPeriod(mm_tc.wPeriodMin);
     atexit(os_undo_timer_resolution);
+#else
+    /*
+     * Raise the system timer resolution as on desktop Windows; otherwise
+     * QEMU timers and sleeps quantize to the default 15.625 ms tick and
+     * the VM runs well below real time.  The multimedia timer API is not
+     * part of the UWP SDK surface but is present at runtime, so resolve
+     * it dynamically.
+     */
+    typedef UINT(WINAPI *TimeBeginPeriodFn)(UINT);
+    HMODULE winmm = GetModuleHandleW(L"winmm.dll");
+    TimeBeginPeriodFn begin_period = NULL;
+    UINT begin_result = (UINT)-1;
+    LARGE_INTEGER freq, t0, t1;
+    int64_t total_us = 0;
+
+    if (winmm == NULL) {
+        winmm = LoadLibraryExW(L"winmm.dll", NULL,
+                               LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (winmm != NULL) {
+        begin_period = (TimeBeginPeriodFn)GetProcAddress(winmm,
+                                                         "timeBeginPeriod");
+    }
+    if (begin_period != NULL) {
+        begin_result = begin_period(1);
+    }
+
+    QueryPerformanceFrequency(&freq);
+    for (int i = 0; i < 8; i++) {
+        QueryPerformanceCounter(&t0);
+        Sleep(1);
+        QueryPerformanceCounter(&t1);
+        total_us += (t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart;
+    }
+    fprintf(stderr,
+            "xemu UWP: timeBeginPeriod(1) returned %u, Sleep(1) averages %d us\n",
+            begin_result, (int)(total_us / 8));
+#endif
 }
 
 void os_set_line_buffering(void)

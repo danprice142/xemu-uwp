@@ -79,6 +79,14 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+/**
+ * tcg_gen_goto_ptr() - jump to translated code
+ * @ptr: host address of the code, e.g. a TB's tc.ptr
+ *
+ * For front ends that find the next TB themselves.
+ */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 
@@ -616,5 +624,15 @@ void tcg_gen_sqrt_f32(TCGv_f32 ret, TCGv_f32 arg);
 void tcg_gen_sqrt_f64(TCGv_f64 ret, TCGv_f64 arg);
 void tcg_gen_sub_f32(TCGv_f32 ret, TCGv_f32 arg1, TCGv_f32 arg2);
 void tcg_gen_sub_f64(TCGv_f64 ret, TCGv_f64 arg1, TCGv_f64 arg2);
+
+/*
+ * x86 hosts: run the SSE insn 0F @opb (F3 0F @opb if @scalar) with the
+ * register at env offset @dst as destination and @src as source operand.
+ * TCG_XBOX_SSE_IMM in @opb appends the immediate byte TCG_XBOX_SSE_IMM8().
+ */
+#define TCG_XBOX_SSE_SCALAR 0x100
+#define TCG_XBOX_SSE_IMM 0x200
+#define TCG_XBOX_SSE_IMM8(imm) (TCG_XBOX_SSE_IMM | ((imm) & 0xff) << 16)
+void tcg_gen_xbox_sse(unsigned opb, bool scalar, intptr_t dst, intptr_t src);
 
 #endif /* TCG_TCG_OP_COMMON_H */

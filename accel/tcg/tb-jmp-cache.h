@@ -12,7 +12,15 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
+#ifdef XBOX
+/*
+ * A title's indirect branch targets overflow 4096 entries; every conflict
+ * miss costs a full hash table walk.
+ */
+#define TB_JMP_CACHE_BITS 16
+#else
 #define TB_JMP_CACHE_BITS 12
+#endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*

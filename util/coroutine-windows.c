@@ -75,7 +75,12 @@ Coroutine *qemu_coroutine_new(void)
     CoroutineWin32 *co;
 
     co = g_malloc0(sizeof(*co));
+#ifdef CONFIG_UWP
+    co->fiber = CreateFiberEx(0, stack_size, 0, coroutine_trampoline,
+                              &co->base);
+#else
     co->fiber = CreateFiber(stack_size, coroutine_trampoline, &co->base);
+#endif
     return &co->base;
 }
 
@@ -96,7 +101,11 @@ Coroutine *qemu_coroutine_self(void)
 
         current = &leader->base;
         set_current(current);
+#ifdef CONFIG_UWP
+        leader->fiber = ConvertThreadToFiberEx(NULL, 0);
+#else
         leader->fiber = ConvertThreadToFiber(NULL);
+#endif
     }
     return current;
 }

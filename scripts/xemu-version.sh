@@ -11,12 +11,13 @@ XEMU_COMMIT=$( \
   elif test -e XEMU_COMMIT; then \
     cat XEMU_COMMIT; \
   fi)
+# A release version in XEMU_VERSION takes precedence over the git tags.
 XEMU_VERSION=$( \
   cd "$dir"; \
-  if test -e .git; then \
+  if test -e XEMU_VERSION; then \
+    tr -d '\r\n' < XEMU_VERSION; \
+  elif test -e .git; then \
     git describe --tags --match 'v*' | cut -c 2- | tr -d '\n'; \
-  elif test -e XEMU_VERSION; then \
-    cat XEMU_VERSION; \
   fi)
 
 if [[ "${XEMU_VERSION}" == "" ]]; then

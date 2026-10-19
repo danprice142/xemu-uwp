@@ -106,6 +106,7 @@ struct TCGLabelQemuLdst {
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
+    tcg_insn_unit *fastmem_site; /* direct access patched on demand */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -2664,6 +2665,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sqrt_f64:
     case INDEX_op_sub_f32:
     case INDEX_op_sub_f64:
+    case INDEX_op_xbox_sse:
         return TCG_TARGET_HAS_fpu;
 
     default:

@@ -45,6 +45,7 @@
 #include "system/tcg.h"
 #include "system/qtest.h"
 #include "system/physmem.h"
+#include "system/cpus.h"
 #include "system/ramblock.h"
 #include "qemu/timer.h"
 #include "qemu/config-file.h"
@@ -850,7 +851,8 @@ static inline bool access_callback_address_matches(MemAccessCallback *cb,
     hwaddr watch_end = cb->addr + cb->len - 1;
     hwaddr access_end = addr + len - 1;
 
-    return !(addr > watch_end || cb->addr > access_end);
+    return qatomic_read(&cb->enabled) &&
+           !(addr > watch_end || cb->addr > access_end);
 }
 
 int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len)
@@ -867,17 +869,63 @@ int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len)
     return ret;
 }
 
+/* Host range of a callback's guest bytes; the region stays mapped. */
+static uintptr_t mem_access_callback_host(MemAccessCallback *cb)
+{
+    return (uintptr_t)memory_region_get_ram_ptr(cb->mr) +
+           (cb->addr - memory_region_get_ram_addr(cb->mr));
+}
+
+/*
+ * Retire the translations of the watched pages only, so they refill with
+ * the current watchpoint state. Runs on the vCPU thread, ordered with the
+ * queued list updates.
+ */
+static void mem_access_callback_flush(CPUState *cpu, uintptr_t host,
+                                      hwaddr len)
+{
+    qatomic_inc(&qemu_mem_access_cb_flushes);
+    tlb_flush_host_range(cpu, host, len);
+}
+
+typedef struct MemAccessCallbackRange {
+    uintptr_t host;
+    hwaddr len;
+} MemAccessCallbackRange;
+
+static void do_mem_access_callback_flush(CPUState *cpu, run_on_cpu_data data)
+{
+    MemAccessCallbackRange *range = data.host_ptr;
+
+    mem_access_callback_flush(cpu, range->host, range->len);
+    g_free(range);
+}
+
+/* Queued work is processed in order with the list updates. */
+static void mem_access_callback_queue_flush(CPUState *cpu,
+                                            MemAccessCallback *cb)
+{
+    MemAccessCallbackRange *range = g_new(MemAccessCallbackRange, 1);
+
+    range->host = mem_access_callback_host(cb);
+    range->len = cb->len;
+    async_run_on_cpu(cpu, do_mem_access_callback_flush,
+                     RUN_ON_CPU_HOST_PTR(range));
+}
+
 static void do_mem_access_callback_insert(CPUState *cpu, run_on_cpu_data data)
 
 {
     MemAccessCallback *cb = (MemAccessCallback *)data.host_ptr;
     QTAILQ_INSERT_TAIL(&cpu->mem_access_callbacks, cb, entry);
+    if (qatomic_read(&cb->enabled)) {
+        mem_access_callback_flush(cpu, mem_access_callback_host(cb), cb->len);
+    }
 }
 
-MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
-                                              hwaddr offset, hwaddr len,
-                                              MemAccessCallbackFunc func,
-                                              void *opaque)
+static MemAccessCallback *mem_access_callback_insert_internal(
+    CPUState *cpu, MemoryRegion *mr, hwaddr offset, hwaddr len,
+    MemAccessCallbackFunc func, void *opaque, bool enabled)
 {
     assert(len > 0);
 
@@ -887,14 +935,53 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
     cb->len = len;
     cb->func = func;
     cb->opaque = opaque;
+    qatomic_set(&cb->enabled, enabled);
 
+    /* An enabled callback retires its pages' translations once listed. */
     async_safe_run_on_cpu(cpu, do_mem_access_callback_insert,
                           RUN_ON_CPU_HOST_PTR(cb));
 
-    // FIXME: flush only applicable pages
-    tlb_flush_all_cpus_synced(cpu);
-
     return cb;
+}
+
+MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
+                                              hwaddr offset, hwaddr len,
+                                              MemAccessCallbackFunc func,
+                                              void *opaque)
+{
+    return mem_access_callback_insert_internal(cpu, mr, offset, len, func,
+                                               opaque, true);
+}
+
+MemAccessCallback *mem_access_callback_insert_disabled(
+    CPUState *cpu, MemoryRegion *mr, hwaddr offset, hwaddr len,
+    MemAccessCallbackFunc func, void *opaque)
+{
+    return mem_access_callback_insert_internal(cpu, mr, offset, len, func,
+                                               opaque, false);
+}
+
+void mem_access_callback_set_enabled(CPUState *cpu, MemAccessCallback *cb,
+                                     bool enabled)
+{
+    bool old_enabled;
+
+    if (cb == NULL) {
+        return;
+    }
+
+    old_enabled = qatomic_xchg(&cb->enabled, enabled);
+    if (old_enabled == enabled) {
+        return;
+    }
+
+    /*
+     * Existing translations cache TLB_WATCHPOINT, so a change in callback
+     * eligibility must invalidate them before the guest continues.  The
+     * flush is queued rather than waited for, so this is safe to call from
+     * a device thread holding a lock that the callback itself acquires.
+     */
+    mem_access_callback_queue_flush(cpu, cb);
 }
 
 static void do_mem_access_callback_remove_by_ref(CPUState *cpu,
@@ -907,15 +994,23 @@ static void do_mem_access_callback_remove_by_ref(CPUState *cpu,
 
 void mem_access_callback_remove_by_ref(CPUState *cpu, MemAccessCallback *cb)
 {
+    bool enabled;
+
     if (!cb) {
         return;
     }
 
+    /*
+     * Stop new slow-path dispatches before the owner releases the callback
+     * opaque.  The queued removal and TLB flush then retire the list entry
+     * and any translations that still carry TLB_WATCHPOINT.
+     */
+    enabled = qatomic_xchg(&cb->enabled, false);
+    if (enabled) {
+        mem_access_callback_queue_flush(cpu, cb);
+    }
     async_safe_run_on_cpu(cpu, do_mem_access_callback_remove_by_ref,
                           RUN_ON_CPU_HOST_PTR(cb));
-
-    // FIXME: flush only applicable pages
-    tlb_flush_all_cpus_synced(cpu);
 }
 
 void mem_check_access_callback_vaddr(CPUState *cpu,

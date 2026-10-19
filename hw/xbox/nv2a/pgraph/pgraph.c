@@ -42,9 +42,36 @@ NV2AState *g_nv2a;
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
+    qatomic_inc(&d->mmio_reads.pgraph);
     PGRAPHState *pg = &d->pgraph;
 
+    if (qatomic_read(&d->pgraph_read_unlocked) &&
+        addr != NV_PGRAPH_RDI_DATA) {
+        uint64_t r;
+
+        switch (addr) {
+        case NV_PGRAPH_INTR:
+            r = qatomic_read(&pg->pending_interrupts);
+            break;
+        case NV_PGRAPH_INTR_EN:
+            r = qatomic_read(&pg->enabled_interrupts);
+            break;
+        default:
+            r = qatomic_read(&pg->regs_[addr]);
+            break;
+        }
+        d->mmio_reads.pgraph_addr_reads[(addr >> 2) & 0x7ff]++;
+        nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
+        return r;
+    }
+
+    int64_t wait_start = g_get_monotonic_time();
     qemu_mutex_lock(&pg->lock);
+    int64_t waited = g_get_monotonic_time() - wait_start;
+    qatomic_set(&d->mmio_reads.pgraph_wait_us,
+                d->mmio_reads.pgraph_wait_us + waited);
+    d->mmio_reads.pgraph_addr_reads[(addr >> 2) & 0x7ff]++;
+    d->mmio_reads.pgraph_addr_wait_us[(addr >> 2) & 0x7ff] += waited;
 
     uint64_t r = 0;
     switch (addr) {
@@ -208,6 +235,7 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 }
 
 static const PGRAPHRenderer *renderers[CONFIG_DISPLAY_RENDERER__COUNT];
+static bool renderer_early_context_initialized[CONFIG_DISPLAY_RENDERER__COUNT];
 
 void pgraph_renderer_register(const PGRAPHRenderer *renderer)
 {
@@ -217,6 +245,12 @@ void pgraph_renderer_register(const PGRAPHRenderer *renderer)
 
 void pgraph_init(NV2AState *d)
 {
+    /*
+     * Register reads without side effects do not wait for the FIFO thread,
+     * which holds pg->lock for a whole method. The guest interrupt handler
+     * and fence polling read registers that are stable at that point.
+     */
+    d->pgraph_read_unlocked = true;
     g_nv2a = d;
 
     PGRAPHState *pg = &d->pgraph;
@@ -263,8 +297,29 @@ static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
         return CONFIG_DISPLAY_RENDERER_VULKAN;
     }
 #endif
+#ifdef CONFIG_D3D12
+    if (renderers[CONFIG_DISPLAY_RENDERER_D3D12]) {
+        return CONFIG_DISPLAY_RENDERER_D3D12;
+    }
+#endif
     fprintf(stderr, "Warning: No available renderer\n");
     return CONFIG_DISPLAY_RENDERER_NULL;
+}
+
+static void ensure_renderer_early_context_init(CONFIG_DISPLAY_RENDERER renderer)
+{
+    const PGRAPHRenderer *r;
+
+    if (renderer >= CONFIG_DISPLAY_RENDERER__COUNT ||
+        renderer_early_context_initialized[renderer]) {
+        return;
+    }
+
+    r = renderers[renderer];
+    if (r != NULL && r->ops.early_context_init) {
+        r->ops.early_context_init();
+    }
+    renderer_early_context_initialized[renderer] = true;
 }
 
 void nv2a_context_init(void)
@@ -276,18 +331,7 @@ void nv2a_context_init(void)
                 renderers[g_config.display.renderer]->name);
     }
 
-    // FIXME: We need a mechanism for renderer to initialize new GL contexts
-    //        on the main thread at run time. For now, just let them all create
-    //        what they need.
-    for (int i = 0; i < ARRAY_SIZE(renderers); i++) {
-        const PGRAPHRenderer *r = renderers[i];
-        if (!r) {
-            continue;
-        }
-        if (r->ops.early_context_init) {
-            r->ops.early_context_init();
-        }
-    }
+    ensure_renderer_early_context_init(g_config.display.renderer);
 }
 
 static bool attempt_renderer_init(PGRAPHState *pg)
@@ -299,6 +343,8 @@ static bool attempt_renderer_init(PGRAPHState *pg)
         xemu_queue_error_message("Configured renderer not available");
         return false;
     }
+
+    ensure_renderer_early_context_init(g_config.display.renderer);
 
     Error *local_err = NULL;
     if (pg->renderer->ops.init) {
@@ -362,6 +408,14 @@ int nv2a_get_framebuffer_surface(void)
 
     qemu_mutex_lock(&pg->renderer_lock);
     assert(!pg->framebuffer_in_use);
+    if (pg->surface_scale_change_pending) {
+        unsigned int scale = pg->pending_surface_scale_factor;
+
+        pg->surface_scale_change_pending = false;
+        if (pg->renderer->ops.set_surface_scale_factor) {
+            pg->renderer->ops.set_surface_scale_factor(d, scale);
+        }
+    }
     pg->framebuffer_in_use = true;
     if (pg->renderer->ops.get_framebuffer_surface) {
         s = pg->renderer->ops.get_framebuffer_surface(d);
@@ -371,7 +425,7 @@ int nv2a_get_framebuffer_surface(void)
     return s;
 }
 
-void nv2a_release_framebuffer_surface(void)
+static void nv2a_release_framebuffer_common(void)
 {
     NV2AState *d = g_nv2a;
     PGRAPHState *pg = &d->pgraph;
@@ -381,16 +435,70 @@ void nv2a_release_framebuffer_surface(void)
     qemu_mutex_unlock(&pg->renderer_lock);
 }
 
+void nv2a_release_framebuffer_surface(void)
+{
+    nv2a_release_framebuffer_common();
+}
+
+bool nv2a_get_display_frame(NV2ADisplayFrame *frame)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+    bool acquired = false;
+
+    if (frame == NULL) {
+        return false;
+    }
+
+    memset(frame, 0, sizeof(*frame));
+
+    qemu_mutex_lock(&pg->renderer_lock);
+    assert(!pg->framebuffer_in_use);
+    if (pg->surface_scale_change_pending) {
+        unsigned int scale = pg->pending_surface_scale_factor;
+
+        pg->surface_scale_change_pending = false;
+        if (pg->renderer->ops.set_surface_scale_factor) {
+            pg->renderer->ops.set_surface_scale_factor(d, scale);
+        }
+    }
+    if (pg->renderer->ops.get_display_frame) {
+        pg->framebuffer_in_use = true;
+        acquired = pg->renderer->ops.get_display_frame(d, frame);
+        if (!acquired) {
+            pg->framebuffer_in_use = false;
+            qemu_cond_broadcast(&pg->framebuffer_released);
+        }
+    }
+    qemu_mutex_unlock(&pg->renderer_lock);
+
+    return acquired;
+}
+
+void nv2a_release_display_frame(void)
+{
+    nv2a_release_framebuffer_common();
+}
+
 void nv2a_set_surface_scale_factor(unsigned int scale)
 {
     NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+
+    scale = MAX(scale, 1);
+    /* Persist the UI selection even when application must be deferred. */
+    g_config.display.quality.surface_scale = scale;
 
     bql_unlock();
-    qemu_mutex_lock(&d->pgraph.renderer_lock);
-    if (d->pgraph.renderer->ops.set_surface_scale_factor) {
-        d->pgraph.renderer->ops.set_surface_scale_factor(d, scale);
+    qemu_mutex_lock(&pg->renderer_lock);
+    if (pg->framebuffer_in_use) {
+        pg->pending_surface_scale_factor = scale;
+        pg->surface_scale_change_pending = true;
+    } else if (pg->renderer->ops.set_surface_scale_factor) {
+        pg->surface_scale_change_pending = false;
+        pg->renderer->ops.set_surface_scale_factor(d, scale);
     }
-    qemu_mutex_unlock(&d->pgraph.renderer_lock);
+    qemu_mutex_unlock(&pg->renderer_lock);
     bql_lock();
 }
 
@@ -401,13 +509,95 @@ unsigned int nv2a_get_surface_scale_factor(void)
 
     bql_unlock();
     qemu_mutex_lock(&d->pgraph.renderer_lock);
-    if (d->pgraph.renderer->ops.get_surface_scale_factor) {
+    if (d->pgraph.surface_scale_change_pending) {
+        s = d->pgraph.pending_surface_scale_factor;
+    } else if (d->pgraph.renderer->ops.get_surface_scale_factor) {
         s = d->pgraph.renderer->ops.get_surface_scale_factor(d);
     }
     qemu_mutex_unlock(&d->pgraph.renderer_lock);
     bql_lock();
 
     return s;
+}
+
+/* The renderer applies shader cache requests from the FIFO thread. */
+static void shader_cache_kick(NV2AState *d)
+{
+    qemu_mutex_lock(&d->pfifo.lock);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+}
+
+void nv2a_shader_cache_set_title(uint32_t title_id)
+{
+    NV2AState *d = g_nv2a;
+
+    if (d == NULL) {
+        return;
+    }
+    qatomic_set(&d->pgraph.shader_cache.title_id, title_id);
+    qatomic_inc(&d->pgraph.shader_cache.request_gen);
+    shader_cache_kick(d);
+}
+
+void nv2a_shader_cache_settings_changed(void)
+{
+    NV2AState *d = g_nv2a;
+
+    if (d == NULL) {
+        return;
+    }
+    qatomic_inc(&d->pgraph.shader_cache.request_gen);
+    shader_cache_kick(d);
+}
+
+void nv2a_custom_textures_settings_changed(void)
+{
+    NV2AState *d = g_nv2a;
+
+    if (d != NULL) {
+        qatomic_inc(&d->pgraph.custom_textures_gen);
+    }
+}
+
+void nv2a_shader_precompile_status(NV2AShaderPrecompileStatus *status)
+{
+    NV2AState *d = g_nv2a;
+    uint32_t gen;
+
+    memset(status, 0, sizeof(*status));
+    if (d == NULL) {
+        return;
+    }
+    status->title_id = qatomic_read(&d->pgraph.shader_cache.title_id);
+    status->foreground = qatomic_read(&d->pgraph.shader_cache.foreground);
+    if (!qatomic_read(&d->pgraph.shader_cache.supported)) {
+        return;
+    }
+    gen = qatomic_load_acquire(&d->pgraph.shader_cache.status_gen);
+    if (gen != qatomic_read(&d->pgraph.shader_cache.request_gen)) {
+        status->state = NV2A_SHADER_PRECOMPILE_LOADING;
+        return;
+    }
+    status->state = qatomic_read(&d->pgraph.shader_cache.state);
+    status->recorded = qatomic_read(&d->pgraph.shader_cache.recorded);
+    status->total = qatomic_read(&d->pgraph.shader_cache.total);
+    status->done = MIN(qatomic_read(&d->pgraph.shader_cache.done),
+                       status->total);
+    status->failed = MIN(qatomic_read(&d->pgraph.shader_cache.failed),
+                         status->total - status->done);
+}
+
+void nv2a_shader_precompile_set_foreground(bool foreground)
+{
+    NV2AState *d = g_nv2a;
+
+    if (d == NULL ||
+        qatomic_read(&d->pgraph.shader_cache.foreground) == foreground) {
+        return;
+    }
+    qatomic_set(&d->pgraph.shader_cache.foreground, foreground);
+    shader_cache_kick(d);
 }
 
 #define METHOD_ADDR(gclass, name) \
@@ -3225,7 +3415,12 @@ void pgraph_process_pending(NV2AState *d)
 void pgraph_process_pending_reports(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
-    pg->renderer->ops.process_pending_reports(d);
+
+    if (pg->renderer->ops.process_pending_reports_fifo) {
+        pg->renderer->ops.process_pending_reports_fifo(d);
+    } else {
+        pg->renderer->ops.process_pending_reports(d);
+    }
 }
 
 void pgraph_pre_savevm_trigger(NV2AState *d)

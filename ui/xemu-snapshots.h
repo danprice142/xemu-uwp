@@ -21,6 +21,7 @@
 #define XEMU_SNAPSHOTS_H
 
 #include "qemu/osdep.h"
+#include "hw/xbox/nv2a/display_frame.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,7 +41,13 @@ extern const char **g_snapshot_shortcut_index_key_map[];
 typedef struct XemuSnapshotData {
     char *disc_path;
     char *xbe_title_name;
+    void *thumbnail_png;
+    size_t thumbnail_png_size;
+    int thumbnail_width;
+    int thumbnail_height;
     GLuint gl_thumbnail;
+    void *d3d12_thumbnail_resource;
+    uint64_t d3d12_thumbnail_texture_id;
 } XemuSnapshotData;
 
 // Implemented in xemu-snapshots.c
@@ -57,7 +64,9 @@ void xemu_snapshots_mark_dirty(void);
 
 // Implemented in xemu-thumbnail.cc
 void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
-bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
+void xemu_snapshots_set_display_frame(const NV2ADisplayFrame *frame);
+bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size,
+                                        int *width, int *height);
 void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
 
 #ifdef __cplusplus

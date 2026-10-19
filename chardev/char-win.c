@@ -75,6 +75,13 @@ static int win_chr_serial_poll(void *opaque)
 
 int win_chr_serial_init(Chardev *chr, const char *filename, Error **errp)
 {
+#ifdef CONFIG_UWP
+    error_setg(errp,
+               "UWP serial chardev '%s' requires a WinRT "
+               "Windows.Devices.SerialCommunication backend",
+               filename);
+    return -1;
+#else
     WinChardev *s = WIN_CHARDEV(chr);
     COMMCONFIG comcfg;
     COMMTIMEOUTS cto = { 0, 0, 0, 0, 0};
@@ -137,6 +144,7 @@ int win_chr_serial_init(Chardev *chr, const char *filename, Error **errp)
 
  fail:
     return -1;
+#endif
 }
 
 int win_chr_pipe_poll(void *opaque)

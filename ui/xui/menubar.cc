@@ -44,7 +44,7 @@ bool g_capture_renderdoc_frame = false;
 void ProcessKeyboardShortcuts(void)
 {
     if (IsShortcutKeyPressed(ImGuiKey_E)) {
-        ActionEjectDisc();
+        ActionEjectDiscToLibrary();
     }
 
     if (IsShortcutKeyPressed(ImGuiKey_O)) {
@@ -71,9 +71,11 @@ void ProcessKeyboardShortcuts(void)
         ActionScreenshot();
     }
 
+#ifndef CONFIG_UWP
     if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
         xemu_toggle_fullscreen();
     }
+#endif
 
 #ifdef CONFIG_RENDERDOC
     if (ImGui::IsKeyPressed(ImGuiKey_F10) && nv2a_dbg_renderdoc_available()) {
@@ -139,7 +141,7 @@ void ShowMainMenu()
 
             ImGui::Separator();
 
-            if (ImGui::MenuItem("Eject Disc", SHORTCUT_MENU_TEXT(E))) ActionEjectDisc();
+            if (ImGui::MenuItem("Eject Disc", SHORTCUT_MENU_TEXT(E))) ActionEjectDiscToLibrary();
             if (ImGui::MenuItem("Load Disc...", SHORTCUT_MENU_TEXT(O))) ActionLoadDisc();
 
             ImGui::Separator();
@@ -155,6 +157,7 @@ void ShowMainMenu()
 
         if (ImGui::BeginMenu("View"))
         {
+            bool view_config_changed = false;
             int ui_scale_idx;
             if (g_config.display.ui.auto_scale) {
                 ui_scale_idx = 0;
@@ -173,15 +176,26 @@ void ShowMainMenu()
                     g_config.display.ui.auto_scale = false;
                     g_config.display.ui.scale = ui_scale_idx;
                 }
+                view_config_changed = true;
             }
 
+#ifdef CONFIG_UWP
+            int uwp_renderer = 0;
+            ImGui::BeginDisabled();
+            ImGui::Combo("Backend", &uwp_renderer, "Direct3D 12\0");
+            ImGui::EndDisabled();
+#else
             ImGui::Combo("Backend", &g_config.display.renderer,
                  "Null\0"
                  "OpenGL\0"
 #ifdef CONFIG_VULKAN
                  "Vulkan\0"
 #endif
+#ifdef CONFIG_D3D12
+                 "Direct3D 12\0"
+#endif
                 );
+#endif
 
             int rendering_scale = nv2a_get_surface_scale_factor() - 1;
             if (ImGui::Combo("Int. Resolution Scale", &rendering_scale,
@@ -196,21 +210,32 @@ void ShowMainMenu()
                              "9x\0"
                              "10x\0")) {
                 nv2a_set_surface_scale_factor(rendering_scale + 1);
+                view_config_changed = true;
             }
 
-            ImGui::Combo("Display Mode", &g_config.display.ui.fit,
-                         "Center\0Scale\0Stretch\0");
+            view_config_changed |= ImGui::Combo(
+                "Display Mode", &g_config.display.ui.fit,
+                "Center\0Scale\0Stretch\0");
             ImGui::SameLine();
             HelpMarker("Controls how the rendered content should be scaled "
                        "into the window");
-            ImGui::Combo("Filter Method", &g_config.display.filtering,
-                         "Linear\0Nearest\0");
-            ImGui::Combo("Aspect Ratio", &g_config.display.ui.aspect_ratio,
-                         "Native\0Auto\0""4:3\0""16:9\0");
+            view_config_changed |= ImGui::Combo(
+                "Filter Method", &g_config.display.filtering,
+                "Linear\0Nearest\0");
+            view_config_changed |= ImGui::Combo(
+                "Aspect Ratio", &g_config.display.ui.aspect_ratio,
+                "Native\0Auto\0""4:3\0""16:9\0");
+#ifndef CONFIG_UWP
             if (ImGui::MenuItem("Fullscreen", "F11",
-                                xemu_is_fullscreen(), true)) {
+                                xemu_is_fullscreen(),
+                                true)) {
                 xemu_toggle_fullscreen();
             }
+#else
+            if (view_config_changed) {
+                xemu_settings_save();
+            }
+#endif
 
             ImGui::EndMenu();
         }
@@ -236,7 +261,7 @@ void ShowMainMenu()
 
             ImGui::MenuItem("Report Compatibility...", NULL,
                             &compatibility_reporter_window.is_open);
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(CONFIG_UWP)
             ImGui::MenuItem("Check for Updates...", NULL, &update_window.is_open);
 #endif
 

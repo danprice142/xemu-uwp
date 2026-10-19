@@ -179,8 +179,10 @@ int qemu_ftruncate64(int fd, int64_t length)
     HANDLE h;
     BOOL res;
 
+#ifndef CONFIG_UWP
     if ((GetVersion() & 0x80000000UL) && (length >> 32) != 0)
         return -1;
+#endif
 
     h = (HANDLE)_get_osfhandle(fd);
 
@@ -251,11 +253,24 @@ static void raw_probe_alignment(BlockDriverState *bs, Error **errp)
     }
 
     if (s->drive_path[0]) {
+#ifdef CONFIG_UWP
+        if (GetDiskFreeSpace(s->drive_path, &sectorsPerCluster,
+                             &dg.Geometry.BytesPerSector,
+                             &freeClusters, &totalClusters) &&
+            is_power_of_2(dg.Geometry.BytesPerSector)) {
+            bs->bl.request_alignment = dg.Geometry.BytesPerSector;
+            return;
+        }
+
+        bs->bl.request_alignment = 512;
+        return;
+#else
         GetDiskFreeSpace(s->drive_path, &sectorsPerCluster,
                          &dg.Geometry.BytesPerSector,
                          &freeClusters, &totalClusters);
         bs->bl.request_alignment = dg.Geometry.BytesPerSector;
         return;
+#endif
     }
 
     /* XXX Does Windows support AIO on less than 512-byte alignment? */
@@ -398,9 +413,13 @@ static int raw_open(BlockDriverState *bs, QDict *options, int flags,
         s->drive_path[0] = 0;
     } else {
         /* Relative path.  */
+#ifdef CONFIG_UWP
+        s->drive_path[0] = 0;
+#else
         char buf[MAX_PATH];
         GetCurrentDirectory(MAX_PATH, buf);
         snprintf(s->drive_path, sizeof(s->drive_path), "%c:\\", buf[0]);
+#endif
     }
 
     wfilename = g_utf8_to_utf16(filename, -1, NULL, NULL, NULL);
@@ -696,9 +715,23 @@ static int raw_reopen_prepare(BDRVReopenState *state,
      */
 
     raw_parse_flags(state->flags, s->aio != NULL, &access_flags, &overlapped);
+#ifdef CONFIG_UWP
+    wchar_t *wfilename = g_utf8_to_utf16(state->bs->filename, -1, NULL, NULL, NULL);
+    if (!wfilename) {
+        error_setg(errp, "Could not convert filename '%s' to UTF-16",
+                   state->bs->filename);
+        ret = -EINVAL;
+        goto fail;
+    }
+    rs->hfile = CreateFileW(wfilename, access_flags,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_EXISTING, overlapped, NULL);
+    g_free(wfilename);
+#else
     rs->hfile = CreateFile(state->bs->filename, access_flags,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_EXISTING, overlapped, NULL);
+#endif
 
     if (rs->hfile == INVALID_HANDLE_VALUE) {
         int err = GetLastError();
@@ -809,6 +842,9 @@ BlockDriver bdrv_file = {
 
 static int find_cdrom(char *cdrom_name, int cdrom_name_size)
 {
+#ifdef CONFIG_UWP
+    return -1;
+#else
     char drives[256], *pdrv = drives;
     UINT type;
 
@@ -825,6 +861,7 @@ static int find_cdrom(char *cdrom_name, int cdrom_name_size)
         pdrv += lstrlen(pdrv) + 1;
     }
     return -1;
+#endif
 }
 
 static int find_device_type(BlockDriverState *bs, const char *filename)

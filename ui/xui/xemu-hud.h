@@ -41,12 +41,35 @@ void xemu_main_loop_unlock(void);
 
 // Implemented in xemu_hud.cc
 void xemu_hud_init(SDL_Window *window, void *sdl_gl_context);
+void xemu_hud_init_d3d12(SDL_Window *window, void *device,
+                         void *command_queue, void *srv_heap,
+                         uint64_t font_srv_cpu, uint64_t font_srv_gpu);
 void xemu_hud_cleanup(void);
 void xemu_hud_update(void);
 void xemu_hud_render(void);
+void xemu_hud_render_d3d12(void *command_list);
+char *xemu_hud_take_screenshot_path(void);
+bool xemu_hud_uses_d3d12(void);
+bool xemu_hud_load_d3d12_image_texture(void *buf, size_t size, void **resource,
+                                       uint64_t *texture_id, int *width,
+                                       int *height);
+bool xemu_hud_load_d3d12_png_texture(void *buf, size_t size, void **resource,
+                                     uint64_t *texture_id, int *width,
+                                     int *height);
+bool xemu_hud_get_d3d12_icon_texture(uint64_t *texture_id, int *width,
+                                     int *height);
+// Creates (when *resource is NULL) or updates a Direct3D 12 HUD texture from
+// tightly packed RGBA8 pixels. The returned texture_id is an ImTextureID.
+bool xemu_hud_upload_d3d12_rgba_texture(const void *pixels, int width,
+                                        int height, void **resource,
+                                        uint64_t *texture_id);
+void xemu_hud_release_d3d12_texture(void *resource);
+void xemu_hud_get_renderer_info(const char **vendor, const char **renderer,
+                                const char **version, const char **shader);
 void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
+bool xemu_hud_is_initialized(void);
 
 #ifdef __cplusplus
 }

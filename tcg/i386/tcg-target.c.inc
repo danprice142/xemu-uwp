@@ -21,6 +21,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#if defined(XBOX) && defined(_WIN64) && !defined(CONFIG_USER_ONLY)
+#define XBOX_FASTMEM_TCG 1
+#include "accel/tcg/xbox-fastmem.h"
+#endif
 
 /* Used for function call generation. */
 #define TCG_TARGET_STACK_ALIGN 16
@@ -2129,6 +2133,46 @@ static void tcg_out_pair_to_vec(TCGContext *s, TCGType type,
     tcg_out8(s, 1);
 }
 
+#ifdef XBOX_FASTMEM_TCG
+static tcg_insn_unit *tcg_out_tlb_lookup(TCGContext *s, TCGReg addr,
+                                         MemOpIdx oi, bool is_ld,
+                                         unsigned a_mask);
+static void tcg_out_qemu_ld_direct(TCGContext *s, TCGReg datalo, TCGReg datahi,
+                                   HostAddress h, TCGType type, MemOp memop);
+static void tcg_out_qemu_st_direct(TCGContext *s, TCGReg datalo, TCGReg datahi,
+                                   HostAddress h, MemOp memop);
+
+/*
+ * Out-of-line copy of the inline TLB fast path for a direct access site.
+ * A patched site lands here, so it costs what the softmmu path always did;
+ * a TLB miss continues with the helper call that follows.
+ */
+static void tcg_out_fastmem_tlb_path(TCGContext *s, TCGLabelQemuLdst *l)
+{
+    MemOp opc = get_memop(l->oi);
+    HostAddress h = {
+        .base = l->addr_reg,
+        .index = TCG_REG_L0,
+        .ofs = 0,
+        .seg = 0,
+    };
+    tcg_insn_unit *miss;
+
+    h.aa = atom_and_align_for_opc(s, opc, MO_ATOM_IFALIGN,
+                                  (opc & MO_SIZE) == MO_128);
+    miss = tcg_out_tlb_lookup(s, l->addr_reg, l->oi, l->is_ld,
+                              (1 << h.aa.align) - 1);
+    if (l->is_ld) {
+        tcg_out_qemu_ld_direct(s, l->datalo_reg, l->datahi_reg, h, l->type,
+                               opc);
+    } else {
+        tcg_out_qemu_st_direct(s, l->datalo_reg, l->datahi_reg, h, opc);
+    }
+    tcg_out_jmp(s, l->raddr);
+    tcg_patch32(miss, s->code_ptr - miss - 4);
+}
+#endif
+
 /*
  * Generate code for the slow path for a load at the end of block
  */
@@ -2137,8 +2181,22 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
     MemOp opc = get_memop(l->oi);
     tcg_insn_unit **label_ptr = &l->label_ptr[0];
 
+#ifdef XBOX_FASTMEM_TCG
+    if (l->fastmem_site) {
+        /* The alignment pre-check also enters through the TLB path. */
+        if (label_ptr[0]) {
+            tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
+            label_ptr[0] = NULL;
+        }
+        xbox_fastmem_stage_site(l->fastmem_site, s->code_ptr, l->raddr,
+                                get_mmuidx(l->oi));
+        tcg_out_fastmem_tlb_path(s, l);
+    }
+#endif
     /* resolve label address */
-    tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
+    if (label_ptr[0]) {
+        tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
+    }
     if (label_ptr[1]) {
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
     }
@@ -2159,8 +2217,22 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
     MemOp opc = get_memop(l->oi);
     tcg_insn_unit **label_ptr = &l->label_ptr[0];
 
+#ifdef XBOX_FASTMEM_TCG
+    if (l->fastmem_site) {
+        /* The alignment pre-check also enters through the TLB path. */
+        if (label_ptr[0]) {
+            tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
+            label_ptr[0] = NULL;
+        }
+        xbox_fastmem_stage_site(l->fastmem_site, s->code_ptr, l->raddr,
+                                get_mmuidx(l->oi));
+        tcg_out_fastmem_tlb_path(s, l);
+    }
+#endif
     /* resolve label address */
-    tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
+    if (label_ptr[0]) {
+        tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
+    }
     if (label_ptr[1]) {
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
     }
@@ -2211,6 +2283,93 @@ static inline int setup_guest_base_seg(void)
 #define MIN_TLB_MASK_TABLE_OFS  INT_MIN
 
 /*
+ * A patched site is overwritten by a 5-byte jmp; keep it at least that
+ * long so the jump never reaches past the site's return address.
+ */
+static void tcg_out_fastmem_site_end(TCGContext *s, TCGLabelQemuLdst *ldst)
+{
+#ifdef XBOX_FASTMEM_TCG
+    if (ldst && ldst->fastmem_site) {
+        int len = tcg_pcrel_diff(s, ldst->fastmem_site) * -1;
+
+        if (len < 5) {
+            tcg_out_nopn(s, 5 - len);
+        }
+    }
+#endif
+}
+
+/*
+ * Emit the softmmu TLB load and compare for @addr. On a hit the host
+ * addend is left in TCG_REG_L0; returns the jne displacement to resolve
+ * to the miss path.
+ */
+static tcg_insn_unit *tcg_out_tlb_lookup(TCGContext *s, TCGReg addr,
+                                         MemOpIdx oi, bool is_ld,
+                                         unsigned a_mask)
+{
+    MemOp s_bits = get_memop(oi) & MO_SIZE;
+    int cmp_ofs = is_ld ? offsetof(CPUTLBEntry, addr_read)
+                        : offsetof(CPUTLBEntry, addr_write);
+    TCGType ttype = TCG_TYPE_I32;
+    TCGType tlbtype = TCG_TYPE_I32;
+    int trexw = 0, hrexw = 0, tlbrexw = 0;
+    unsigned mem_index = get_mmuidx(oi);
+    unsigned s_mask = (1 << s_bits) - 1;
+    int fast_ofs = tlb_mask_table_ofs(s, mem_index);
+    int tlb_mask;
+    tcg_insn_unit *miss;
+
+    if (TCG_TARGET_REG_BITS == 64) {
+        ttype = s->addr_type;
+        trexw = (ttype == TCG_TYPE_I32 ? 0 : P_REXW);
+        if (TCG_TYPE_PTR == TCG_TYPE_I64) {
+            hrexw = P_REXW;
+            tlbtype = TCG_TYPE_I64;
+            tlbrexw = P_REXW;
+        }
+    }
+
+    tcg_out_mov(s, tlbtype, TCG_REG_L0, addr);
+    tcg_out_shifti(s, SHIFT_SHR + tlbrexw, TCG_REG_L0,
+                   TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+
+    tcg_out_modrm_offset(s, OPC_AND_GvEv + trexw, TCG_REG_L0, TCG_AREG0,
+                         fast_ofs + offsetof(CPUTLBDescFast, mask));
+
+    tcg_out_modrm_offset(s, OPC_ADD_GvEv + hrexw, TCG_REG_L0, TCG_AREG0,
+                         fast_ofs + offsetof(CPUTLBDescFast, table));
+
+    /*
+     * If the required alignment is at least as large as the access,
+     * simply copy the address and mask.  For lesser alignments,
+     * check that the complete access does not cross pages.
+     */
+    if (a_mask >= s_mask) {
+        tcg_out_mov(s, ttype, TCG_REG_L1, addr);
+    } else {
+        tcg_out_modrm_offset(s, OPC_LEA + trexw, TCG_REG_L1,
+                             addr, s_mask - a_mask);
+    }
+    tlb_mask = TARGET_PAGE_MASK | a_mask;
+    tgen_arithi(s, ARITH_AND + trexw, TCG_REG_L1, tlb_mask, 0);
+
+    /* cmp 0(TCG_REG_L0), TCG_REG_L1 */
+    tcg_out_modrm_offset(s, OPC_CMP_GvEv + trexw,
+                         TCG_REG_L1, TCG_REG_L0, cmp_ofs);
+
+    /* jne slow_path */
+    tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
+    miss = s->code_ptr;
+    s->code_ptr += 4;
+
+    /* TLB Hit.  */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_L0, TCG_REG_L0,
+               offsetof(CPUTLBEntry, addend));
+    return miss;
+}
+
+/*
  * For softmmu, perform the TLB load and compare.
  * For useronly, perform any required alignment tests.
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
@@ -2224,6 +2383,42 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
     MemOp s_bits = opc & MO_SIZE;
     unsigned a_mask;
 
+#ifdef XBOX_FASTMEM_TCG
+    /*
+     * Kernel-mode accesses go straight to the guest address space mirror
+     * at R12. The site faults into the mirror's handler, which maps the
+     * page or patches the site into a jump to the slow path below.
+     */
+    if (tcg_use_softmmu && qatomic_read(&xbox_fastmem_codegen) &&
+        get_mmuidx(oi) == xbox_fastmem_mmu_idx &&
+        s->addr_type == TCG_TYPE_I32) {
+        h->aa = atom_and_align_for_opc(s, opc, MO_ATOM_IFALIGN,
+                                       s_bits == MO_128);
+        a_mask = (1 << h->aa.align) - 1;
+
+        ldst = new_ldst_label(s);
+        ldst->is_ld = is_ld;
+        ldst->oi = oi;
+        ldst->addr_reg = addr;
+        if (a_mask) {
+            int jcc = tcg_out_cmp(s, TCG_COND_TSTNE, addr, a_mask, true,
+                                  false);
+
+            tcg_out_opc(s, OPC_JCC_long + jcc, 0, 0, 0);
+            ldst->label_ptr[0] = s->code_ptr;
+            s->code_ptr += 4;
+        }
+        /* A 32-bit move zero-extends the guest address. */
+        tcg_out_mov(s, TCG_TYPE_I32, TCG_REG_L0, addr);
+        h->base = TCG_REG_L0;
+        h->index = TCG_REG_R12;
+        h->ofs = 0;
+        h->seg = 0;
+        ldst->fastmem_site = s->code_ptr;
+        return ldst;
+    }
+#endif
+
     if (tcg_use_softmmu) {
         h->index = TCG_REG_L0;
         h->ofs = 0;
@@ -2236,67 +2431,11 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
     a_mask = (1 << h->aa.align) - 1;
 
     if (tcg_use_softmmu) {
-        int cmp_ofs = is_ld ? offsetof(CPUTLBEntry, addr_read)
-                            : offsetof(CPUTLBEntry, addr_write);
-        TCGType ttype = TCG_TYPE_I32;
-        TCGType tlbtype = TCG_TYPE_I32;
-        int trexw = 0, hrexw = 0, tlbrexw = 0;
-        unsigned mem_index = get_mmuidx(oi);
-        unsigned s_mask = (1 << s_bits) - 1;
-        int fast_ofs = tlb_mask_table_ofs(s, mem_index);
-        int tlb_mask;
-
         ldst = new_ldst_label(s);
         ldst->is_ld = is_ld;
         ldst->oi = oi;
         ldst->addr_reg = addr;
-
-        if (TCG_TARGET_REG_BITS == 64) {
-            ttype = s->addr_type;
-            trexw = (ttype == TCG_TYPE_I32 ? 0 : P_REXW);
-            if (TCG_TYPE_PTR == TCG_TYPE_I64) {
-                hrexw = P_REXW;
-                tlbtype = TCG_TYPE_I64;
-                tlbrexw = P_REXW;
-            }
-        }
-
-        tcg_out_mov(s, tlbtype, TCG_REG_L0, addr);
-        tcg_out_shifti(s, SHIFT_SHR + tlbrexw, TCG_REG_L0,
-                       TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
-
-        tcg_out_modrm_offset(s, OPC_AND_GvEv + trexw, TCG_REG_L0, TCG_AREG0,
-                             fast_ofs + offsetof(CPUTLBDescFast, mask));
-
-        tcg_out_modrm_offset(s, OPC_ADD_GvEv + hrexw, TCG_REG_L0, TCG_AREG0,
-                             fast_ofs + offsetof(CPUTLBDescFast, table));
-
-        /*
-         * If the required alignment is at least as large as the access,
-         * simply copy the address and mask.  For lesser alignments,
-         * check that we don't cross pages for the complete access.
-         */
-        if (a_mask >= s_mask) {
-            tcg_out_mov(s, ttype, TCG_REG_L1, addr);
-        } else {
-            tcg_out_modrm_offset(s, OPC_LEA + trexw, TCG_REG_L1,
-                                 addr, s_mask - a_mask);
-        }
-        tlb_mask = TARGET_PAGE_MASK | a_mask;
-        tgen_arithi(s, ARITH_AND + trexw, TCG_REG_L1, tlb_mask, 0);
-
-        /* cmp 0(TCG_REG_L0), TCG_REG_L1 */
-        tcg_out_modrm_offset(s, OPC_CMP_GvEv + trexw,
-                             TCG_REG_L1, TCG_REG_L0, cmp_ofs);
-
-        /* jne slow_path */
-        tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
-        ldst->label_ptr[0] = s->code_ptr;
-        s->code_ptr += 4;
-
-        /* TLB Hit.  */
-        tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_L0, TCG_REG_L0,
-                   offsetof(CPUTLBEntry, addend));
+        ldst->label_ptr[0] = tcg_out_tlb_lookup(s, addr, oi, is_ld, a_mask);
     } else if (a_mask) {
         int jcc;
 
@@ -2485,6 +2624,7 @@ static void tgen_qemu_ld(TCGContext *s, TCGType type, TCGReg data,
 
     ldst = prepare_host_addr(s, &h, addr, oi, true);
     tcg_out_qemu_ld_direct(s, data, -1, h, type, get_memop(oi));
+    tcg_out_fastmem_site_end(s, ldst);
 
     if (ldst) {
         ldst->type = type;
@@ -2507,6 +2647,7 @@ static void tgen_qemu_ld2(TCGContext *s, TCGType type, TCGReg datalo,
 
     ldst = prepare_host_addr(s, &h, addr, oi, true);
     tcg_out_qemu_ld_direct(s, datalo, datahi, h, type, get_memop(oi));
+    tcg_out_fastmem_site_end(s, ldst);
 
     if (ldst) {
         ldst->type = type;
@@ -2639,6 +2780,7 @@ static void tgen_qemu_st(TCGContext *s, TCGType type, TCGReg data,
 
     ldst = prepare_host_addr(s, &h, addr, oi, false);
     tcg_out_qemu_st_direct(s, data, -1, h, get_memop(oi));
+    tcg_out_fastmem_site_end(s, ldst);
 
     if (ldst) {
         ldst->type = type;
@@ -2669,6 +2811,7 @@ static void tgen_qemu_st2(TCGContext *s, TCGType type, TCGReg datalo,
 
     ldst = prepare_host_addr(s, &h, addr, oi, false);
     tcg_out_qemu_st_direct(s, datalo, datahi, h, get_memop(oi));
+    tcg_out_fastmem_site_end(s, ldst);
 
     if (ldst) {
         ldst->type = type;
@@ -3103,6 +3246,30 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, TCGType type,
         tcg_out_st(s, TCG_TYPE_I32, a0, TCG_REG_ESP, -8);
         tcg_out_modrm_offset(s, OPC_LDMXCSR, 2, TCG_REG_ESP, -8);
         break;
+
+    case INDEX_op_xbox_sse: {
+        /*
+         * a0: env, a1: opcode byte | TCG_XBOX_SSE_SCALAR, a2: destination
+         * offset, args[3]: source offset. Packed forms use VEX so that the
+         * memory operand needs no alignment; VEX.vvvv is unused by SQRT.
+         */
+        bool scalar = a1 & TCG_XBOX_SSE_SCALAR;
+        int sse_opc = (a1 & 0xff) | P_EXT | (scalar ? P_SIMDF3 : 0);
+
+        tcg_out_modrm_offset(s, 0x10 | P_EXT, TCG_TMP_VEC, a0, a2);
+        if (!scalar && have_avx1) {
+            tcg_out_vex_modrm_offset(s, sse_opc, TCG_TMP_VEC,
+                                     (a1 & 0xff) == 0x51 ? 0 : TCG_TMP_VEC,
+                                     a0, args[3]);
+        } else {
+            tcg_out_modrm_offset(s, sse_opc, TCG_TMP_VEC, a0, args[3]);
+        }
+        if (a1 & TCG_XBOX_SSE_IMM) {
+            tcg_out8(s, a1 >> 16);
+        }
+        tcg_out_modrm_offset(s, 0x11 | P_EXT, TCG_TMP_VEC, a0, a2);
+        break;
+    }
 
     OP_f32_f64(st80f):
         tcg_out_fld_xmm(s, a0, dp);
@@ -4438,6 +4605,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_st80f_f64:
         return C_O0_I2(x, L);
     case INDEX_op_flcr:
+    case INDEX_op_xbox_sse:
         return C_O0_I1(r);
     case INDEX_op_mul_f32:
     case INDEX_op_mul_f64:
@@ -5113,6 +5281,13 @@ static void tcg_target_qemu_prologue(TCGContext *s)
         tcg_out_push(s, tcg_target_callee_save_regs[i]);
     }
 
+#ifdef XBOX_FASTMEM_TCG
+    if (tcg_use_softmmu && xbox_fastmem_init()) {
+        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_R12,
+                     (uintptr_t)xbox_fastmem_arena);
+        tcg_regset_set_reg(s->reserved_regs, TCG_REG_R12);
+    }
+#endif
     if (!tcg_use_softmmu && guest_base) {
         int seg = setup_guest_base_seg();
         if (seg != 0) {

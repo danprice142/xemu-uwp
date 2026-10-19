@@ -18,6 +18,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/cpus.h"
+#if defined(XBOX) && defined(_WIN32)
+#include "accel/tcg/xbox-fastmem.h"
+#endif
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -267,6 +271,20 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         goto hit;
     }
 
+#ifdef XBOX
+    qatomic_set(&qemu_tb_jc_misses, qemu_tb_jc_misses + 1);
+    if (tb == NULL) {
+        qemu_tb_jc_miss_kind[0]++;
+    } else if (jc->array[hash].pc != s.pc) {
+        qemu_tb_jc_miss_kind[1]++;
+    } else {
+        qemu_tb_jc_miss_kind[2]++;
+        /* Accumulate which state bits differ. */
+        qemu_tb_jc_flag_diff |= (tb->flags ^ s.flags) |
+                                (tb->cs_base != s.cs_base ? 0x80000000u : 0) |
+                                (tb_cflags(tb) != s.cflags ? 0x40000000u : 0);
+    }
+#endif
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
@@ -395,6 +413,9 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
  */
 const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 {
+#ifdef XBOX
+    qatomic_set(&qemu_tb_lookup_ptrs, qemu_tb_lookup_ptrs + 1);
+#endif
     CPUState *cpu = env_cpu(env);
     TranslationBlock *tb;
 
@@ -535,6 +556,15 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+
+#if defined(XBOX) && defined(__x86_64__)
+    /*
+     * Translated x87 code runs with the guest rounding mode in MXCSR and
+     * restores the default when the sequence ends; a fault leaving the TB
+     * early skips that restore.
+     */
+    __builtin_ia32_ldmxcsr(0x1f80);
+#endif
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
@@ -985,6 +1015,15 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
+#ifdef XBOX
+            if (last_tb != NULL) {
+                qemu_tb_loop_kind[0]++;
+            } else if (tb_exit == TB_EXIT_REQUESTED) {
+                qemu_tb_loop_kind[1]++;
+            } else {
+                qemu_tb_loop_kind[2]++;
+            }
+#endif
             tb = tb_lookup(cpu, s);
             if (tb == NULL) {
                 CPUJumpCache *jc;
@@ -1013,6 +1052,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              */
             if (tb_page_addr1(tb) != -1) {
                 last_tb = NULL;
+#ifdef XBOX
+                qemu_tb_loop_kind[3]++;
+#endif
             }
 #endif
             /* See if we can patch the calling TB. */
@@ -1047,6 +1089,9 @@ int cpu_exec(CPUState *cpu)
 
     /* replay_interrupt may need current_cpu */
     current_cpu = cpu;
+#if defined(XBOX) && defined(_WIN32)
+    xbox_prof_register_vcpu();
+#endif
 
     if (cpu_handle_halt(cpu)) {
         return EXCP_HALTED;

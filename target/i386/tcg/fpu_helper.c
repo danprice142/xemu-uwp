@@ -3467,6 +3467,8 @@ void update_mxcsr_status(CPUX86State *env)
 
     /* set flush to zero */
     set_flush_to_zero((mxcsr & SSE_FZ) ? 1 : 0, &env->sse_status);
+
+    cpu_sync_sse_default_hflag(env);
 }
 
 void update_mxcsr_from_sse_status(CPUX86State *env)

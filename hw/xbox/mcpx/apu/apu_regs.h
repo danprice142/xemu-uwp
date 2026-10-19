@@ -286,6 +286,7 @@
 #      define NV_PAVS_VOICE_PAR_STATE_EFCUR_SUSTAIN             5
 #      define NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE             6
 #      define NV_PAVS_VOICE_PAR_STATE_EFCUR_FORCE_RELEASE       7
+#      define NV_PAVS_VOICE_PAR_STATE_EFCUR_COMPLETE            8
 #   define NV_PAVS_VOICE_PAR_STATE_EACUR                    (0xF << 28)
 #define NV_PAVS_VOICE_PAR_OFFSET                         0x00000058
 #   define NV_PAVS_VOICE_PAR_OFFSET_CBO                     0x00FFFFFF

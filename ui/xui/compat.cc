@@ -22,6 +22,7 @@
 #include "widgets.hh"
 #include "viewport-manager.hh"
 #include "font-manager.hh"
+#include "xemu-hud.h"
 #include "xemu-version.h"
 #include "reporting.hh"
 #include "../xemu-settings.h"
@@ -74,10 +75,16 @@ void CompatibilityReporter::Draw()
     }
 
     if (ImGui::IsWindowAppearing()) {
-        report.gl_vendor = (const char *)glGetString(GL_VENDOR);
-        report.gl_renderer = (const char *)glGetString(GL_RENDERER);
-        report.gl_version = (const char *)glGetString(GL_VERSION);
-        report.gl_shading_language_version = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+        const char *gpu_vendor = NULL;
+        const char *gpu_renderer = NULL;
+        const char *gpu_version = NULL;
+        const char *gpu_shader = NULL;
+        xemu_hud_get_renderer_info(&gpu_vendor, &gpu_renderer, &gpu_version,
+                                    &gpu_shader);
+        report.gl_vendor = gpu_vendor;
+        report.gl_renderer = gpu_renderer;
+        report.gl_version = gpu_version;
+        report.gl_shading_language_version = gpu_shader;
         struct xbe *xbe = xemu_get_xbe_info();
         is_xbe_identified = xbe != NULL;
         if (is_xbe_identified) {
@@ -132,6 +139,7 @@ void CompatibilityReporter::Draw()
         report.token = token_buf;
         dirty = true;
     }
+    TextFieldActivateWithA();
     ImGui::PopFont();
     ImGui::SameLine();
     if (ImGui::Button("Get Token")) {
@@ -158,6 +166,7 @@ void CompatibilityReporter::Draw()
         report.compat_comments = description;
         dirty = true;
     }
+    TextFieldActivateWithA();
 
     if (ImGui::TreeNode("Report Details")) {
         ImGui::PushFont(g_font_mgr.m_fixed_width_font);

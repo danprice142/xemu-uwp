@@ -21,6 +21,7 @@
 #include "font-manager.hh"
 #include "viewport-manager.hh"
 #include "ui/xemu-os-utils.h"
+#include "xemu-hud.h"
 #include "gl-helpers.hh"
 
 void Separator()
@@ -314,13 +315,6 @@ void FilePicker(const char *str_id, const char *current_path,
     bool status =
         ImGui::ButtonEx("###file_button", bb, ImGuiButtonFlags_AllowOverlap);
     ImGui::SetItemAllowOverlap();
-    if (status) {
-        if (dir) {
-            ShowOpenFolderDialog(current_path, on_select);
-        } else {
-            ShowOpenFileDialog(filters, nfilters, current_path, on_select);
-        }
-    }
     ImGui::PopID();
     ImGui::PopStyleVar();
 
@@ -348,9 +342,19 @@ void FilePicker(const char *str_id, const char *current_path,
     char *clear_button_id = g_strdup_printf("%s_clear", str_id);
     ImGui::PushID(clear_button_id);
 
-    bool clear = ImGui::Button(ICON_FA_XMARK, ImVec2(ts_clear_icon.x, bb.y));
+    bool clear = ImGui::ButtonEx(ICON_FA_XMARK,
+                                 ImVec2(ts_clear_icon.x, bb.y),
+                                 ImGuiButtonFlags_NoNavFocus);
     if (clear) {
         on_select("");
+    }
+
+    if (status && !clear) {
+        if (dir) {
+            ShowOpenFolderDialog(current_path, on_select);
+        } else {
+            ShowOpenFileDialog(filters, nfilters, current_path, on_select);
+        }
     }
 
     ImGui::PopID();
@@ -361,6 +365,113 @@ void FilePicker(const char *str_id, const char *current_path,
     ImGui::PopFont();
 
     ImGui::PopStyleColor();
+}
+
+static std::string NormalizeStoragePath(const char *path)
+{
+    std::string normalized = path ? path : "";
+    for (char &c : normalized) {
+        if (c == '/') {
+            c = '\\';
+        } else {
+            c = (char)g_ascii_tolower((unsigned char)c);
+        }
+    }
+    while (!normalized.empty() && normalized.back() == '\\') {
+        normalized.pop_back();
+    }
+    return normalized;
+}
+
+void StorageLocationSelector(const char *str_id, const char *current_path,
+                             const char *development_files_path,
+                             const char *usb_storage_path,
+                             std::function<void(const char *new_path)> on_select)
+{
+    enum { kDevelopmentFiles, kUsbStorage, kCustomFolder };
+
+    std::string current = NormalizeStoragePath(current_path);
+    int selected = kCustomFolder;
+    if (current == NormalizeStoragePath(development_files_path)) {
+        selected = kDevelopmentFiles;
+    } else if (current == NormalizeStoragePath(usb_storage_path)) {
+        selected = kUsbStorage;
+    }
+
+    const char *desc = (current_path && strlen(current_path)) ?
+                           current_path : "(None Selected)";
+    int choice = selected;
+    if (ChevronCombo(str_id, &choice,
+                     "Development files\0"
+                     "USB storage\0"
+                     "Custom folder\0",
+                     desc)) {
+        if (choice == kDevelopmentFiles) {
+            on_select(development_files_path);
+        } else if (choice == kUsbStorage) {
+            on_select(usb_storage_path);
+        } else {
+            ShowOpenFolderDialog(current_path, on_select);
+        }
+    }
+}
+
+void TextFieldActivateWithA()
+{
+    ImGuiContext &g = *GImGui;
+    ImGuiID id = ImGui::GetItemID();
+
+    /* Activation without the text-input preference only selects a text
+     * field; repeat it next frame as a text-input request. */
+    if (id != 0 && g.NavActivateId == id && !ImGui::IsItemActive() &&
+        !(g.NavActivateFlags & ImGuiActivateFlags_PreferInput)) {
+        ImGui::ActivateItemByID(id);
+        g.NavNextActivateFlags = ImGuiActivateFlags_PreferInput;
+    }
+}
+
+void StorageFileSelector(const char *str_id, const char *current_path,
+                         const char *development_files_dir,
+                         const char *usb_storage_dir,
+                         const char *default_file_name,
+                         const SDL_DialogFileFilter *filters, int nfilters,
+                         std::function<void(const char *new_path)> on_select)
+{
+    enum { kDevelopmentFiles, kUsbStorage, kCustomFile };
+
+    bool has_path = current_path && *current_path;
+    int selected = kCustomFile;
+    if (has_path) {
+        gchar *folder = g_path_get_dirname(current_path);
+        std::string current = NormalizeStoragePath(folder);
+        g_free(folder);
+        if (current == NormalizeStoragePath(development_files_dir)) {
+            selected = kDevelopmentFiles;
+        } else if (current == NormalizeStoragePath(usb_storage_dir)) {
+            selected = kUsbStorage;
+        }
+    }
+
+    int choice = selected;
+    if (ChevronCombo(str_id, &choice,
+                     "Development files\0"
+                     "USB storage\0"
+                     "Custom file\0",
+                     has_path ? current_path : "(None Selected)")) {
+        if (choice == kCustomFile) {
+            ShowOpenFileDialog(filters, nfilters, current_path, on_select);
+            return;
+        }
+        gchar *name = has_path ? g_path_get_basename(current_path) :
+                                 g_strdup(default_file_name);
+        gchar *path = g_build_filename(choice == kDevelopmentFiles ?
+                                           development_files_dir :
+                                           usb_storage_dir,
+                                       name, NULL);
+        on_select(path);
+        g_free(path);
+        g_free(name);
+    }
 }
 
 void DrawComboChevron()
@@ -529,6 +640,24 @@ void Logo()
     ImGui::SetCursorPosY(ImGui::GetCursorPosY()-25*g_viewport_mgr.m_scale);
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-256*g_viewport_mgr.m_scale)/2);
 
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+    if (xemu_hud_uses_d3d12()) {
+        uint64_t texture_id = 0;
+        int width = 0;
+        int height = 0;
+        if (xemu_hud_get_d3d12_icon_texture(&texture_id, &width, &height)) {
+            ImVec2 size(128 * g_viewport_mgr.m_scale,
+                        128 * g_viewport_mgr.m_scale);
+            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - size.x) / 2);
+            ImGui::Image((ImTextureID)texture_id, size);
+        } else {
+            ImGui::TextUnformatted("xemu");
+        }
+        return;
+    }
+#endif
+
+#ifdef CONFIG_OPENGL
     static uint32_t time_start = 0;
     static uint32_t offset = 0;
     uint32_t now = SDL_GetTicks();
@@ -563,4 +692,7 @@ void Logo()
 
     RenderLogo(now - time_start + offset);
     logo_fbo->Restore();
+#else
+    ImGui::TextUnformatted("xemu");
+#endif
 }

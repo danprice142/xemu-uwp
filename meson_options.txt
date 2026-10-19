@@ -121,6 +121,12 @@ option('vfio_user_server', type: 'feature', value: 'disabled',
        description: 'vfio-user server support')
 option('dbus_display', type: 'feature', value: 'auto',
        description: '-display dbus support')
+option('d3d12', type : 'feature', value : 'disabled',
+       description: 'Direct3D 12 NV2A renderer support')
+option('uwp', type : 'feature', value : 'disabled',
+       description: 'Universal Windows Platform build support')
+option('ffmpeg', type : 'feature', value : 'auto',
+       description: 'ffmpeg (libav*) support for network video broadcast')
 option('tpm', type : 'feature', value : 'auto',
        description: 'TPM support')
 option('valgrind', type : 'feature', value: 'auto',
@@ -212,6 +218,8 @@ option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
 option('opengl', type : 'feature', value : 'enabled',
        description: 'OpenGL support')
+option('vulkan', type : 'feature', value : 'auto',
+       description: 'Vulkan NV2A renderer support')
 option('rdma', type : 'feature', value : 'auto',
        description: 'Enable RDMA-based migration')
 option('gtk', type : 'feature', value : 'auto',

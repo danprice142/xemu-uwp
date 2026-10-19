@@ -19,8 +19,11 @@
 #pragma once
 
 void ActionEjectDisc();
+// Ejects the disc and, when the game library is in use, returns to it.
+void ActionEjectDiscToLibrary();
 void ActionLoadDisc();
 void ActionLoadDiscFile(const char *file_path);
+bool ActionLoadDiscFileChecked(const char *file_path);
 void ActionTogglePause();
 void ActionReset();
 void ActionShutdown();

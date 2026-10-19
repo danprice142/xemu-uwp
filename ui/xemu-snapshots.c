@@ -18,11 +18,15 @@
  */
 
 #include "xemu-snapshots.h"
+#include "xemu-game-library.h"
 #include "xemu-settings.h"
 #include "xemu-xbe.h"
+#include "xui/xemu-hud.h"
 
 #include <SDL3/SDL.h>
+#ifdef CONFIG_OPENGL
 #include <epoxy/gl.h>
+#endif
 
 #include "block/aio.h"
 #include "block/block_int.h"
@@ -34,6 +38,7 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
 #include "system/runstate.h"
+#include "hw/xbox/nv2a/nv2a.h"
 
 #include "ui/console.h"
 #include "ui/input.h"
@@ -56,7 +61,13 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
 {
     data->disc_path = NULL;
     data->xbe_title_name = NULL;
+    data->thumbnail_png = NULL;
+    data->thumbnail_png_size = 0;
+    data->thumbnail_width = 0;
+    data->thumbnail_height = 0;
     data->gl_thumbnail = 0;
+    data->d3d12_thumbnail_resource = NULL;
+    data->d3d12_thumbnail_texture_id = 0;
 
     int res = bdrv_snapshot_load_tmp(bs_ro, info->id_str, info->name, err);
     if (res < 0) {
@@ -115,15 +126,10 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
     offset += 4;
 
     if (thumbnail_size) {
-        GLuint thumbnail;
-        glGenTextures(1, &thumbnail);
         assert(size >= (offset + thumbnail_size));
-        if (xemu_snapshots_load_png_to_texture(thumbnail, &buf[offset],
-                                               thumbnail_size)) {
-            data->gl_thumbnail = thumbnail;
-        } else {
-            glDeleteTextures(1, &thumbnail);
-        }
+        data->thumbnail_png = g_malloc(thumbnail_size);
+        memcpy(data->thumbnail_png, &buf[offset], thumbnail_size);
+        data->thumbnail_png_size = thumbnail_size;
         offset += thumbnail_size;
     }
 
@@ -141,9 +147,17 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
 
     if (*data) {
         for (int i = 0; i < xemu_snapshots_len; ++i) {
+            g_free((*data)[i].disc_path);
             g_free((*data)[i].xbe_title_name);
-            if ((*data)[i].gl_thumbnail) {
+            g_free((*data)[i].thumbnail_png);
+#ifdef CONFIG_OPENGL
+            if ((*data)[i].gl_thumbnail && SDL_GL_GetCurrentContext()) {
                 glDeleteTextures(1, &((*data)[i].gl_thumbnail));
+            }
+#endif
+            if ((*data)[i].d3d12_thumbnail_resource) {
+                xemu_hud_release_d3d12_texture(
+                    (*data)[i].d3d12_thumbnail_resource);
             }
         }
         g_free(*data);
@@ -242,7 +256,14 @@ void xemu_snapshots_load(const char *vm_name, Error **err)
 {
     bool vm_running = runstate_is_running();
     vm_stop(RUN_STATE_RESTORE_VM);
-    if (load_snapshot(vm_name, NULL, false, NULL, err) && vm_running) {
+    if (!load_snapshot(vm_name, NULL, false, NULL, err)) {
+        return;
+    }
+    /* The restored scene's pipelines belong to its disc's list, title 0's
+     * until the title is known. */
+    nv2a_shader_cache_set_title(
+        xemu_game_library_title_id_for_path(g_config.sys.files.dvd_path));
+    if (vm_running) {
         vm_start();
     }
 }

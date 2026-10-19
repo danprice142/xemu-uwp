@@ -34,6 +34,11 @@
 #include "decode-new.h"
 
 #include "exec/log.h"
+#if defined(XBOX) && !defined(TARGET_X86_64)
+#include "accel/tcg/tb-hash.h"
+#include "accel/tcg/xbox-fastmem.h"
+#include "tcg/tcg-temp-internal.h"
+#endif
 
 static int g_use_hard_fpu;
 
@@ -1725,6 +1730,14 @@ static void gen_flush_fp(DisasContext *s)
 {
     fp_pc_wrapper(flush_fp_regs)(s);
     s->fpstt_delta = 0;
+    if (s->flcr_set) {
+        /*
+         * gen_flcr() loaded the guest rounding mode into MXCSR. Restore the
+         * default before helpers and other translated code run: softfloat's
+         * hardfloat paths (guest SSE among them) assume round-to-nearest.
+         */
+        tcg_gen_flcr(tcg_constant_i32(0x1f80));
+    }
     s->flcr_set = false;
 }
 
@@ -2757,6 +2770,92 @@ static void gen_bnd_jmp(DisasContext *s)
     }
 }
 
+#if defined(XBOX) && !defined(TARGET_X86_64)
+#define CPU_ENV_OFFSET(field) \
+    (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
+
+/*
+ * tcg_gen_lookup_and_goto_ptr() with the jump cache probed from the
+ * translated code. Indirect branches and returns are frequent, and the
+ * helper call, its CPU state collection and its prologue cost more than
+ * the probe. Any mismatch takes the helper, so
+ * the checks only have to cover what tb_lookup() accepts as a hit with
+ * the state x86_get_tb_cpu_state() and curr_cflags() would produce.
+ */
+static void gen_lookup_and_goto_ptr_inline(DisasContext *s)
+{
+    TCGLabel *miss;
+    TCGv_i32 pc, cs_base, t0, t1;
+    TCGv_ptr ptr, tb;
+    TCGv_i64 v0, v1;
+
+    if ((tb_cflags(s->base.tb) & CF_NO_GOTO_PTR) ||
+        !qatomic_read(&xbox_tb_inline_lookup)) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    miss = gen_new_label();
+    pc = tcg_temp_ebb_new_i32();
+    cs_base = tcg_temp_ebb_new_i32();
+    t0 = tcg_temp_ebb_new_i32();
+    t1 = tcg_temp_ebb_new_i32();
+    ptr = tcg_temp_ebb_new_ptr();
+    tb = tcg_temp_ebb_new_ptr();
+    v0 = tcg_temp_ebb_new_i64();
+    v1 = tcg_temp_ebb_new_i64();
+
+    /* Breakpoints and single-step are checked by the helper. */
+    tcg_gen_ld_ptr(ptr, tcg_env, CPU_ENV_OFFSET(breakpoints.tqh_first));
+    tcg_gen_brcondi_ptr(TCG_COND_NE, ptr, 0, miss);
+    tcg_gen_ld_i32(t0, tcg_env, CPU_ENV_OFFSET(singlestep_enabled));
+    tcg_gen_brcondi_i32(TCG_COND_NE, t0, 0, miss);
+
+    tcg_gen_ld_i32(cs_base, tcg_env, offsetof(CPUX86State, segs[R_CS].base));
+    tcg_gen_add_i32(pc, cpu_eip, cs_base);
+
+    /* Slot address; must match tb_jmp_cache_hash_func(). */
+    tcg_gen_shri_i32(t0, pc, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_xor_i32(t0, t0, pc);
+    tcg_gen_shri_i32(t1, t0, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_andi_i32(t1, t1, TB_JMP_PAGE_MASK);
+    tcg_gen_andi_i32(t0, t0, TB_JMP_ADDR_MASK);
+    tcg_gen_or_i32(t0, t0, t1);
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    tcg_gen_shli_i32(t0, t0, 4);
+    tcg_gen_ext_i32_ptr(tb, t0);
+    tcg_gen_ld_ptr(ptr, tcg_env, CPU_ENV_OFFSET(tb_jmp_cache));
+    tcg_gen_add_ptr(ptr, ptr, tb);
+
+    tcg_gen_ld_ptr(tb, ptr, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
+    tcg_gen_ld_i64(v0, ptr, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_extu_i32_i64(v1, pc);
+    tcg_gen_brcond_i64(TCG_COND_NE, v0, v1, miss);
+
+    tcg_gen_ld_i32(t0, tcg_env, offsetof(CPUX86State, eflags));
+    tcg_gen_andi_i32(t0, t0,
+                     IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK);
+    tcg_gen_ld_i32(t1, tcg_env, offsetof(CPUX86State, hflags));
+    tcg_gen_or_i32(t0, t0, t1);
+    tcg_gen_ld_i32(t1, tb, offsetof(TranslationBlock, flags));
+    tcg_gen_brcond_i32(TCG_COND_NE, t0, t1, miss);
+    tcg_gen_ld_i64(v0, tb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_extu_i32_i64(v1, cs_base);
+    tcg_gen_brcond_i64(TCG_COND_NE, v0, v1, miss);
+    /* An invalidated TB carries CF_INVALID and fails here. */
+    tcg_gen_ld_i32(t0, tcg_env, CPU_ENV_OFFSET(tcg_cflags));
+    tcg_gen_ld_i32(t1, tb, offsetof(TranslationBlock, cflags));
+    tcg_gen_brcond_i32(TCG_COND_NE, t0, t1, miss);
+
+    tcg_gen_ld_ptr(ptr, tb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(ptr);
+
+    gen_set_label(miss);
+    tcg_gen_lookup_and_goto_ptr();
+}
+#endif
+
 /*
  * Generate an end of block, including common tasks such as generating
  * single step traps, resetting the RF flag, and handling the interrupt
@@ -2789,7 +2888,11 @@ gen_eob(DisasContext *s, int mode)
     } else if (mode == DISAS_JUMP &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
+#if defined(XBOX) && !defined(TARGET_X86_64)
+        gen_lookup_and_goto_ptr_inline(s);
+#else
         tcg_gen_lookup_and_goto_ptr();
+#endif
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }
@@ -3116,11 +3219,17 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             gen_helper_frstor(tcg_env, s->A0,
                               tcg_constant_i32(s->dflag - 1));
             update_fip = update_fdp = false;
+            /* The restored control word changes HF_FPU_PC. */
+            gen_update_eip_next(s);
+            gen_eob(s, DISAS_EOB_ONLY);
             break;
         case 0x2e: /* fnsave mem */
             gen_helper_fsave(tcg_env, s->A0,
                              tcg_constant_i32(s->dflag - 1));
             update_fip = update_fdp = false;
+            /* fnsave reinitializes the control word, changing HF_FPU_PC. */
+            gen_update_eip_next(s);
+            gen_eob(s, DISAS_EOB_ONLY);
             break;
         case 0x2f: /* fnstsw mem */
             gen_helper_fnstsw(s->tmp2_i32, tcg_env);

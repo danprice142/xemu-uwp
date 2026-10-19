@@ -16,6 +16,12 @@ void tcg_gen_flcr(TCGv_i32 arg)
     tcg_gen_op1_i32(INDEX_op_flcr, arg);
 }
 
+void tcg_gen_xbox_sse(unsigned opb, bool scalar, intptr_t dst, intptr_t src)
+{
+    tcg_gen_op4(INDEX_op_xbox_sse, TCG_TYPE_PTR, tcgv_ptr_arg(tcg_env),
+                opb | (scalar ? TCG_XBOX_SSE_SCALAR : 0), dst, src);
+}
+
 void tcg_gen_st80f_f32(TCGv_f32 arg, TCGv_ptr dst)
 {
     tcg_gen_op2(INDEX_op_st80f_f32, TCG_TYPE_F32, tcgv_f32_arg(arg), tcgv_ptr_arg(dst));

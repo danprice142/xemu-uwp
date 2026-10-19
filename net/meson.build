@@ -49,7 +49,9 @@ if have_vhost_net_user
   system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('vhost-user.c'), if_false: files('vhost-user-stub.c'))
 endif
 
-if host_os == 'windows'
+if is_uwp
+  system_ss.add(files('tap-uwp-stub.c'))
+elif host_os == 'windows'
   system_ss.add(files('tap-win32.c'))
   system_ss.add(files('capture_win_ifnames.c'))
 elif host_os == 'linux'
@@ -62,7 +64,11 @@ else
   system_ss.add(files('tap.c', 'tap-stub.c'))
 endif
 
-system_ss.add([libpcap, files('pcap.c')])
+if is_uwp
+  system_ss.add(files('pcap-uwp-stub.c'))
+else
+  system_ss.add([libpcap, files('pcap.c')])
+endif
 
 if have_vhost_net_vdpa
   system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('vhost-vdpa.c'), if_false: files('vhost-vdpa-stub.c'))

@@ -115,10 +115,12 @@ meson_options_help() {
   printf "%s\n" '  crypto-afalg    Linux AF_ALG crypto backend driver'
   printf "%s\n" '  curl            CURL block device driver'
   printf "%s\n" '  curses          curses UI'
+  printf "%s\n" '  d3d12           Direct3D 12 NV2A renderer support'
   printf "%s\n" '  dbus-display    -display dbus support'
   printf "%s\n" '  dmg             dmg image format support'
   printf "%s\n" '  docs            Documentations build support'
   printf "%s\n" '  dsound          DirectSound sound support'
+  printf "%s\n" '  ffmpeg          ffmpeg (libav*) support for network video broadcast'
   printf "%s\n" '  fuse            FUSE block device export'
   printf "%s\n" '  fuse-lseek      SEEK_HOLE/SEEK_DATA support for FUSE exports'
   printf "%s\n" '  gcrypt          libgcrypt cryptography support'
@@ -200,10 +202,12 @@ meson_options_help() {
   printf "%s\n" '  tcg             TCG support'
   printf "%s\n" '  tools           build support utilities that come with QEMU'
   printf "%s\n" '  tpm             TPM support'
+  printf "%s\n" '  uwp             Universal Windows Platform build support'
   printf "%s\n" '  u2f             U2F emulation support'
   printf "%s\n" '  uadk            UADK Library support'
   printf "%s\n" '  usb-redir       libusbredir support'
   printf "%s\n" '  valgrind        valgrind debug support for coroutine stacks'
+  printf "%s\n" '  vulkan          Vulkan NV2A renderer support'
   printf "%s\n" '  vde             vde network backend support'
   printf "%s\n" '  vdi             vdi image format support'
   printf "%s\n" '  vduse-blk-export'
@@ -296,6 +300,8 @@ _meson_option_parse() {
     --enable-curses) printf "%s" -Dcurses=enabled ;;
     --disable-curses) printf "%s" -Dcurses=disabled ;;
     --datadir=*) quote_sh "-Ddatadir=$2" ;;
+    --enable-d3d12) printf "%s" -Dd3d12=enabled ;;
+    --disable-d3d12) printf "%s" -Dd3d12=disabled ;;
     --enable-dbus-display) printf "%s" -Ddbus_display=enabled ;;
     --disable-dbus-display) printf "%s" -Ddbus_display=disabled ;;
     --enable-debug-info) printf "%s" -Ddebug=true ;;
@@ -320,6 +326,8 @@ _meson_option_parse() {
     --enable-fdt) printf "%s" -Dfdt=enabled ;;
     --disable-fdt) printf "%s" -Dfdt=disabled ;;
     --enable-fdt=*) quote_sh "-Dfdt=$2" ;;
+    --enable-ffmpeg) printf "%s" -Dffmpeg=enabled ;;
+    --disable-ffmpeg) printf "%s" -Dffmpeg=disabled ;;
     --enable-fuse) printf "%s" -Dfuse=enabled ;;
     --disable-fuse) printf "%s" -Dfuse=disabled ;;
     --enable-fuse-lseek) printf "%s" -Dfuse_lseek=enabled ;;
@@ -525,6 +533,8 @@ _meson_option_parse() {
     --disable-tools) printf "%s" -Dtools=disabled ;;
     --enable-tpm) printf "%s" -Dtpm=enabled ;;
     --disable-tpm) printf "%s" -Dtpm=disabled ;;
+    --enable-uwp) printf "%s" -Duwp=enabled ;;
+    --disable-uwp) printf "%s" -Duwp=disabled ;;
     --enable-trace-backends=*) quote_sh "-Dtrace_backends=$2" ;;
     --with-trace-file=*) quote_sh "-Dtrace_file=$2" ;;
     --enable-tsan) printf "%s" -Dtsan=true ;;
@@ -539,6 +549,8 @@ _meson_option_parse() {
     --disable-usb-redir) printf "%s" -Dusb_redir=disabled ;;
     --enable-valgrind) printf "%s" -Dvalgrind=enabled ;;
     --disable-valgrind) printf "%s" -Dvalgrind=disabled ;;
+    --enable-vulkan) printf "%s" -Dvulkan=enabled ;;
+    --disable-vulkan) printf "%s" -Dvulkan=disabled ;;
     --enable-vde) printf "%s" -Dvde=enabled ;;
     --disable-vde) printf "%s" -Dvde=disabled ;;
     --enable-vdi) printf "%s" -Dvdi=enabled ;;

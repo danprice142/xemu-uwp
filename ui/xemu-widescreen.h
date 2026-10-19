@@ -33,6 +33,10 @@ extern "C" {
 void xemu_set_widescreen(bool widescreen);
 bool xemu_get_widescreen(void);
 
+/* Whether the guest is told it drives a 16:9 television: the Auto and 16:9
+ * display aspect ratios. */
+bool xemu_get_widescreen_tv(void);
+
 #ifdef __cplusplus
 }
 #endif

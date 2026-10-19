@@ -29,7 +29,9 @@
 #include "ui/xemu-input.h"
 
 extern "C" {
+#ifndef CONFIG_UWP
 #include "net/pcap.h"
+#endif
 #undef snprintf  // FIXME
 }
 
@@ -83,7 +85,11 @@ public:
     std::string m_description;
     std::string m_friendly_name;
 
+#ifndef CONFIG_UWP
     NetworkInterface(pcap_if_t *pcap_desc, char *_friendlyname = NULL);
+#else
+    NetworkInterface(const char *name, const char *description);
+#endif
 };
 
 class NetworkInterfaceManager
@@ -110,9 +116,10 @@ protected:
 public:
     MainMenuNetworkView();
     void Draw() override;
-    void DrawPcapOptions(bool appearing);
-    void DrawNatOptions(bool appearing);
-    void DrawUdpOptions(bool appearing);
+    // Each returns true when a change needs the connection re-established.
+    bool DrawPcapOptions(bool appearing);
+    bool DrawNatOptions(bool appearing);
+    bool DrawUdpOptions(bool appearing);
 };
 
 class MainMenuSnapshotsView : public virtual MainMenuTabView
@@ -169,7 +176,11 @@ class MainMenuScene : public virtual Scene {
 protected:
     EasingAnimation                 m_animation;
     bool                            m_focus_view;
+    // The settings pane has navigation; otherwise the category list does.
+    bool                            m_content_active;
+    bool                            m_focus_tab;
     bool                            m_had_focus_last_frame;
+    bool                            m_had_active_item_last_frame;
     int                             m_current_view_index;
     int                             m_next_view_index;
     BackgroundGradient              m_background;

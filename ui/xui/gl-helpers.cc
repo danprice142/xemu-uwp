@@ -35,6 +35,7 @@
 
 Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
 GLuint g_controller_duke_tex, g_controller_s_tex, g_logo_tex, g_icon_tex, g_xmu_tex;
+static bool g_custom_rendering_initialized;
 
 enum class ShaderType {
     Blit,
@@ -83,6 +84,7 @@ Fbo::Fbo(int width, int height)
 {
     w = width;
     h = height;
+    impl = NULL;
 
     // Allocate the texture
     glGenTextures(1, &tex);
@@ -112,6 +114,11 @@ Fbo::~Fbo()
 {
     glDeleteTextures(1, &tex);
     glDeleteFramebuffers(1, &fbo);
+}
+
+uint64_t Fbo::Texture()
+{
+    return tex;
 }
 
 void Fbo::Target()
@@ -457,6 +464,7 @@ void InitCustomRendering(void)
     g_icon_tex = LoadTextureFromMemory(xemu_64x64_data, xemu_64x64_size, false);
 
     g_framebuffer_shader = NewDecalShader(ShaderType::BlitGamma);
+    g_custom_rendering_initialized = true;
 }
 
 static void RenderMeter(DecalShader *s, float x, float y, float width,
@@ -796,6 +804,10 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
                       uint32_t secondary_color, ControllerState *state)
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     if (strcmp(bound_drivers[state->bound], DRIVER_S) == 0)
         RenderControllerS(frame_x, frame_y, primary_color, secondary_color,
                           state);
@@ -807,6 +819,10 @@ void RenderController(float frame_x, float frame_y, uint32_t primary_color,
 void RenderControllerPort(float frame_x, float frame_y, int i,
                           uint32_t port_color)
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     glUseProgram(g_decal_shader->prog);
     glBindVertexArray(g_decal_shader->vao);
     glActiveTexture(GL_TEXTURE0);
@@ -836,6 +852,10 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
 void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                uint32_t secondary_color)
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     glUseProgram(g_decal_shader->prog);
     glBindVertexArray(g_decal_shader->vao);
     glActiveTexture(GL_TEXTURE0);
@@ -855,6 +875,10 @@ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
 
 void RenderLogo(uint32_t time)
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     uint32_t color = 0x62ca13ff;
 
     g_logo_shader->time = time;
@@ -886,6 +910,10 @@ void ScaleDimensions(int src_width, int src_height, int max_width, int max_heigh
 
 void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2])
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     
@@ -942,6 +970,10 @@ static float GetDisplayAspectRatio(int width, int height)
 
 void RenderFramebuffer(GLint tex, int width, int height, bool flip)
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     int tw, th;
     float scale[2];
 
@@ -977,6 +1009,10 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
 
 bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width, int max_height)
 {
+    if (!g_custom_rendering_initialized) {
+        return false;
+    }
+
     int width, height;
 
     glActiveTexture(GL_TEXTURE0);
@@ -1011,6 +1047,10 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
 
 void SaveScreenshot(GLuint tex, bool flip)
 {
+    if (!g_custom_rendering_initialized) {
+        return;
+    }
+
     Error *err = NULL;
     char fname[128];
     std::vector<uint8_t> png;

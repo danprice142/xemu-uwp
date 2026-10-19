@@ -27,10 +27,17 @@
 #include "qemu/option.h"
 #include "qemu/timer.h"
 #include "qemu/config-file.h"
+#include "ui/input.h"
 
 #include "xemu-input.h"
+#include "xemu-dsu.h"
 #include "xemu-notifications.h"
+#include "xemu-pointer-aim.h"
 #include "xemu-settings.h"
+#ifdef CONFIG_UWP
+#include "uwp-gamepad.h"
+#endif
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -91,6 +98,164 @@ ControllerState *bound_controllers[4] = { NULL, NULL, NULL, NULL };
 const char *bound_drivers[4] = { DRIVER_DUKE, DRIVER_DUKE, DRIVER_DUKE,
                                  DRIVER_DUKE };
 int test_mode;
+
+static ControllerState dsu_controllers[XEMU_DSU_MAX_PLAYERS];
+static char dsu_controller_names[XEMU_DSU_MAX_PLAYERS][32];
+static XemuPointerAimState dsu_pointer_aim[XEMU_DSU_MAX_PLAYERS];
+
+enum XemuDSUMotionTarget {
+    XEMU_DSU_MOTION_MOUSE = 0,
+    XEMU_DSU_MOTION_RIGHT_STICK,
+    XEMU_DSU_MOTION_LEFT_STICK,
+    XEMU_DSU_MOTION_DPAD,
+    XEMU_DSU_MOTION_LIGHTGUN,
+};
+
+typedef struct XemuDSUMotionConfig {
+    bool enabled;
+    int target;
+    float horizontal_sensitivity;
+    float vertical_sensitivity;
+} XemuDSUMotionConfig;
+
+typedef struct XemuDSUMotionMapperState {
+    bool target_valid;
+    bool logged_mapping;
+    int target;
+    uint32_t packet_number;
+    int64_t last_received_us;
+    double lightgun_x;
+    double lightgun_y;
+    double mouse_remainder_x;
+    double mouse_remainder_y;
+} XemuDSUMotionMapperState;
+
+static XemuDSUMotionMapperState
+    dsu_motion_mapper[XEMU_DSU_MAX_PLAYERS];
+
+static XemuDSUMotionConfig xemu_input_get_dsu_motion_config(unsigned player)
+{
+    XemuDSUMotionConfig config = {
+        .enabled = false,
+        .target = XEMU_DSU_MOTION_RIGHT_STICK,
+        .horizontal_sensitivity = 1.0f,
+        .vertical_sensitivity = 1.0f,
+    };
+
+#define LOAD_DSU_MOTION_CONFIG(n)                                           \
+    config.enabled = g_config.input.dsu.player##n.motion;                   \
+    config.target = g_config.input.dsu.player##n.motion_target;             \
+    config.horizontal_sensitivity =                                        \
+        g_config.input.dsu.player##n.motion_sensitivity_horizontal;         \
+    config.vertical_sensitivity =                                          \
+        g_config.input.dsu.player##n.motion_sensitivity_vertical
+    switch (player) {
+    case 0: LOAD_DSU_MOTION_CONFIG(1); break;
+    case 1: LOAD_DSU_MOTION_CONFIG(2); break;
+    case 2: LOAD_DSU_MOTION_CONFIG(3); break;
+    case 3: LOAD_DSU_MOTION_CONFIG(4); break;
+    default: break;
+    }
+#undef LOAD_DSU_MOTION_CONFIG
+
+    config.target = CLAMP(config.target, XEMU_DSU_MOTION_MOUSE,
+                          XEMU_DSU_MOTION_LIGHTGUN);
+    if (!isfinite(config.horizontal_sensitivity)) {
+        config.horizontal_sensitivity = 1.0f;
+    }
+    if (!isfinite(config.vertical_sensitivity)) {
+        config.vertical_sensitivity = 1.0f;
+    }
+    config.horizontal_sensitivity =
+        CLAMP(config.horizontal_sensitivity, 0.1f, 5.0f);
+    config.vertical_sensitivity =
+        CLAMP(config.vertical_sensitivity, 0.1f, 5.0f);
+    return config;
+}
+
+static void xemu_input_reset_dsu_motion_mapper(unsigned player, int target)
+{
+    XemuDSUMotionMapperState *state = &dsu_motion_mapper[player];
+    memset(state, 0, sizeof(*state));
+    state->target_valid = true;
+    state->target = target;
+}
+
+static bool xemu_input_take_dsu_motion_sample(
+    unsigned player, int target, const XemuDSUControllerState *controller,
+    double *dt)
+{
+    XemuDSUMotionMapperState *state = &dsu_motion_mapper[player];
+
+    if (!state->target_valid || state->target != target) {
+        xemu_input_reset_dsu_motion_mapper(player, target);
+    }
+    if (state->packet_number == controller->packet_number &&
+        state->last_received_us == controller->last_received_us) {
+        return false;
+    }
+
+    if (state->last_received_us > 0 &&
+        controller->last_received_us > state->last_received_us) {
+        *dt = (controller->last_received_us - state->last_received_us) /
+              1000000.0;
+    } else {
+        *dt = 1.0 / 60.0;
+    }
+    *dt = CLAMP(*dt, 1.0 / 1000.0, 0.1);
+    state->packet_number = controller->packet_number;
+    state->last_received_us = controller->last_received_us;
+    return true;
+}
+
+static int16_t xemu_input_motion_axis(float rate)
+{
+    int value = (int)lrintf(rate * 16384.0f);
+    return (int16_t)CLAMP(value, INT16_MIN, INT16_MAX);
+}
+
+static const char *xemu_input_dsu_motion_target_name(int target)
+{
+    static const char *names[] = {
+        "mouse", "right stick", "left stick", "D-Pad", "lightgun"
+    };
+    return names[CLAMP(target, XEMU_DSU_MOTION_MOUSE,
+                       XEMU_DSU_MOTION_LIGHTGUN)];
+}
+
+static bool xemu_input_port_accepts_local(unsigned port)
+{
+    ControllerState *state = bound_controllers[port];
+    if (state == NULL) {
+        return true;
+    }
+    if (state->type != INPUT_DEVICE_DSU_GAMEPAD) {
+        return false;
+    }
+
+    /* A replacement DSU controller owns its port. Only an auxiliary DSU
+     * controller may share the port with a newly connected local gamepad. */
+    return xemu_dsu_player_is_addon(port);
+}
+
+enum {
+    DSU_BTN_SHARE = 0x0001,
+    DSU_BTN_L3 = 0x0002,
+    DSU_BTN_R3 = 0x0004,
+    DSU_BTN_OPTIONS = 0x0008,
+    DSU_BTN_DPAD_UP = 0x0010,
+    DSU_BTN_DPAD_RIGHT = 0x0020,
+    DSU_BTN_DPAD_DOWN = 0x0040,
+    DSU_BTN_DPAD_LEFT = 0x0080,
+    DSU_BTN_L2 = 0x0100,
+    DSU_BTN_R2 = 0x0200,
+    DSU_BTN_L1 = 0x0400,
+    DSU_BTN_R1 = 0x0800,
+    DSU_BTN_TRIANGLE = 0x1000,
+    DSU_BTN_CIRCLE = 0x2000,
+    DSU_BTN_CROSS = 0x4000,
+    DSU_BTN_SQUARE = 0x8000,
+};
 
 static const char **port_index_to_settings_key_map[] = {
     &g_config.input.bindings.port1,
@@ -207,15 +372,34 @@ static void xemu_input_bindings_set_in_range(ControllerState *con)
 #undef CHECK_RESET_AXIS
 }
 
+static bool xemu_input_get_gamepad_mapping_id(ControllerState *con,
+                                              char *guid, size_t guid_size)
+{
+    if (con->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        SDL_GUIDToString(con->sdl_joystick_guid, guid, guid_size);
+        return true;
+    }
+
+#ifdef CONFIG_UWP
+    if (con->type == INPUT_DEVICE_UWP_GAMEPAD) {
+        snprintf(guid, guid_size, "uwp-gamepad-%d", con->uwp_gamepad_index);
+        return true;
+    }
+#endif
+
+    return false;
+}
+
 static void xemu_input_bindings_reload_map(ControllerState *con)
 {
-    assert(con->type == INPUT_DEVICE_SDL_GAMEPAD);
-
     char guid[35] = { 0 };
-    SDL_GUIDToString(con->sdl_joystick_guid, guid, sizeof(guid));
+    if (!xemu_input_get_gamepad_mapping_id(con, guid, sizeof(guid))) {
+        return;
+    }
     if (!xemu_settings_load_gamepad_mapping(guid, &con->controller_map)) {
         return;
     }
+    xemu_input_bindings_set_in_range(con);
 
     // If this controller did not exist in the mapping array, the config will
     // have been reallocated. Any gamepad mapping pointers for other controllers
@@ -223,12 +407,13 @@ static void xemu_input_bindings_reload_map(ControllerState *con)
     ControllerState *iter, *next;
     bool is_new_mapping;
     QTAILQ_FOREACH_SAFE (iter, &available_controllers, entry, next) {
-        if (iter == con || iter->type != INPUT_DEVICE_SDL_GAMEPAD) {
+        if (iter == con ||
+            !xemu_input_get_gamepad_mapping_id(iter, guid, sizeof(guid))) {
             continue;
         }
 
         memset(guid, 0, sizeof(guid));
-        SDL_GUIDToString(iter->sdl_joystick_guid, guid, sizeof(guid));
+        xemu_input_get_gamepad_mapping_id(iter, guid, sizeof(guid));
 
         is_new_mapping =
             xemu_settings_load_gamepad_mapping(guid, &iter->controller_map);
@@ -254,14 +439,307 @@ static const char *get_bound_driver(int port)
         return DRIVER_DUKE;
     if (strcmp(driver, DRIVER_S) == 0)
         return DRIVER_S;
+    if (strcmp(driver, DRIVER_LIGHTGUN) == 0)
+        return DRIVER_LIGHTGUN;
 
     return DRIVER_DUKE;
 }
 
 static const int port_map[4] = { 3, 4, 1, 2 };
 
+#ifdef CONFIG_UWP
+static int last_uwp_gamepad_count = -1;
+static int64_t last_uwp_gamepad_scan_ts;
+static char uwp_gamepad_names[XEMU_UWP_MAX_GAMEPADS][64];
+
+static ControllerState *xemu_input_find_uwp_gamepad(int index)
+{
+    ControllerState *iter;
+    QTAILQ_FOREACH (iter, &available_controllers, entry) {
+        if (iter->type == INPUT_DEVICE_UWP_GAMEPAD &&
+            iter->uwp_gamepad_index == index) {
+            return iter;
+        }
+    }
+
+    return NULL;
+}
+
+static void xemu_input_free_controller(ControllerState *state)
+{
+    for (int i = 0; i < 2; i++) {
+        if (state->peripherals[i]) {
+            g_free(state->peripherals[i]);
+        }
+    }
+    free(state);
+}
+
+static void xemu_input_remove_uwp_gamepad(ControllerState *state)
+{
+    fprintf(stderr, "xemu input: Windows.Gaming.Input gamepad removed "
+            "index=%d name='%s'\n",
+            state->uwp_gamepad_index, state->name);
+
+    if (state->bound >= 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Port %d disconnected", state->bound + 1);
+        xemu_queue_notification(buf);
+        xemu_input_bind(state->bound, NULL, 0);
+    }
+
+    QTAILQ_REMOVE(&available_controllers, state, entry);
+    xemu_input_free_controller(state);
+}
+
+static void xemu_input_remove_sdl_gamepads_for_uwp(void)
+{
+    ControllerState *iter, *next;
+    QTAILQ_FOREACH_SAFE (iter, &available_controllers, entry, next) {
+        if (iter->type != INPUT_DEVICE_SDL_GAMEPAD) {
+            continue;
+        }
+
+        fprintf(stderr,
+                "xemu input: replacing SDL gamepad with native "
+                "Windows.Gaming.Input path name='%s' instance=%d\n",
+                iter->name ? iter->name : "(null)", iter->sdl_joystick_id);
+
+        if (iter->bound >= 0) {
+            xemu_input_bind(iter->bound, NULL, 0);
+        }
+
+        QTAILQ_REMOVE(&available_controllers, iter, entry);
+        if (iter->sdl_gamepad) {
+            SDL_CloseGamepad(iter->sdl_gamepad);
+        }
+        xemu_input_free_controller(iter);
+    }
+}
+
+static void xemu_input_add_uwp_gamepad(int index)
+{
+    if (xemu_input_find_uwp_gamepad(index)) {
+        return;
+    }
+
+    ControllerState *new_con = malloc(sizeof(ControllerState));
+    memset(new_con, 0, sizeof(ControllerState));
+    new_con->type = INPUT_DEVICE_UWP_GAMEPAD;
+    snprintf(uwp_gamepad_names[index], sizeof(uwp_gamepad_names[index]),
+             "Xbox UWP Gamepad %d", index + 1);
+    new_con->name = uwp_gamepad_names[index];
+    new_con->uwp_gamepad_index = index;
+    new_con->bound = -1;
+    new_con->peripheral_types[0] = PERIPHERAL_NONE;
+    new_con->peripheral_types[1] = PERIPHERAL_NONE;
+    new_con->peripherals[0] = NULL;
+    new_con->peripherals[1] = NULL;
+
+    QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
+    xemu_input_bindings_reload_map(new_con);
+
+    fprintf(stderr,
+            "xemu input: Windows.Gaming.Input gamepad added index=%d "
+            "name='%s'\n",
+            index, new_con->name);
+
+    int port = 0;
+    bool did_bind = false;
+    while (!did_bind) {
+        port = xemu_input_get_controller_default_bind_port(new_con, port);
+        if (port < 0) {
+            break;
+        } else if (xemu_input_port_accepts_local(port)) {
+            xemu_input_bind(port, new_con, 0);
+            did_bind = true;
+            break;
+        } else {
+            port++;
+        }
+    }
+
+    if (!did_bind && g_config.input.auto_bind) {
+        for (port = 0; port < 4; port++) {
+            if (xemu_input_port_accepts_local(port)) {
+                xemu_input_bind(port, new_con, 1);
+                did_bind = true;
+                break;
+            }
+        }
+    }
+
+    if (did_bind) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Connected '%s' to port %d",
+                 new_con->name, port + 1);
+        xemu_queue_notification(buf);
+        xemu_input_rebind_xmu(port);
+    }
+}
+
+static void xemu_input_scan_uwp_gamepads(bool force)
+{
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (!force && ABS(now - last_uwp_gamepad_scan_ts) < 1000000) {
+        return;
+    }
+    last_uwp_gamepad_scan_ts = now;
+
+    int count = xemu_uwp_gamepad_count();
+    if (count != last_uwp_gamepad_count) {
+        fprintf(stderr,
+                "xemu input: Windows.Gaming.Input gamepad count=%d\n",
+                count);
+        last_uwp_gamepad_count = count;
+    }
+
+    if (count > 0) {
+        xemu_input_remove_sdl_gamepads_for_uwp();
+    }
+
+    ControllerState *iter, *next;
+    QTAILQ_FOREACH_SAFE (iter, &available_controllers, entry, next) {
+        if (iter->type == INPUT_DEVICE_UWP_GAMEPAD &&
+            iter->uwp_gamepad_index >= count) {
+            xemu_input_remove_uwp_gamepad(iter);
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        xemu_input_add_uwp_gamepad(i);
+    }
+}
+#endif
+
+static void xemu_input_init_dsu_controllers(void)
+{
+    for (unsigned player = 0; player < XEMU_DSU_MAX_PLAYERS; player++) {
+        ControllerState *state = &dsu_controllers[player];
+
+        memset(state, 0, sizeof(*state));
+        snprintf(dsu_controller_names[player],
+                 sizeof(dsu_controller_names[player]),
+                 "DSU Player %u", player + 1);
+        state->type = INPUT_DEVICE_DSU_GAMEPAD;
+        state->name = dsu_controller_names[player];
+        state->bound = -1;
+        state->peripheral_types[0] = PERIPHERAL_NONE;
+        state->peripheral_types[1] = PERIPHERAL_NONE;
+        xemu_pointer_aim_reset(&dsu_pointer_aim[player]);
+        xemu_input_reset_dsu_motion_mapper(
+            player, xemu_input_get_dsu_motion_config(player).target);
+    }
+}
+
+static void xemu_input_restore_saved_binding(unsigned port)
+{
+    ControllerState *iter;
+
+    QTAILQ_FOREACH (iter, &available_controllers, entry) {
+        if (iter->bound < 0 &&
+            xemu_input_get_controller_default_bind_port(iter, 0) ==
+                (int)port) {
+            xemu_input_bind(port, iter, 0);
+            xemu_input_rebind_xmu(port);
+            return;
+        }
+    }
+}
+
+static void xemu_input_sync_dsu_bindings(void)
+{
+    for (unsigned player = 0; player < XEMU_DSU_MAX_PLAYERS; player++) {
+        XemuDSUPlayerState dsu;
+        XemuDSUMotionConfig motion =
+            xemu_input_get_dsu_motion_config(player);
+        ControllerState *synthetic = &dsu_controllers[player];
+        bool enabled = xemu_dsu_get_player_state(player, &dsu) &&
+                       ((dsu.enabled_data_types &
+                         (XEMU_DSU_DATA_GAMEPAD | XEMU_DSU_DATA_TOUCH |
+                          XEMU_DSU_DATA_MOUSE)) ||
+                        ((dsu.enabled_data_types & XEMU_DSU_DATA_MOTION) &&
+                         motion.target != XEMU_DSU_MOTION_MOUSE));
+
+        if (enabled && bound_controllers[player] == NULL) {
+            xemu_input_bind(player, synthetic, 0);
+            char message[96];
+            snprintf(message, sizeof(message),
+                     "DSU input configured for port %u", player + 1);
+            xemu_queue_notification(message);
+        } else if (!enabled && bound_controllers[player] == synthetic) {
+            xemu_input_bind(player, NULL, 0);
+            xemu_input_restore_saved_binding(player);
+        }
+    }
+}
+
+static void xemu_input_update_dsu_motion_mouse(void)
+{
+    bool queued = false;
+
+    for (unsigned player = 0; player < XEMU_DSU_MAX_PLAYERS; player++) {
+        XemuDSUPlayerState dsu;
+        XemuDSUMotionConfig config =
+            xemu_input_get_dsu_motion_config(player);
+        XemuDSUMotionMapperState *state = &dsu_motion_mapper[player];
+        double dt;
+
+        if (!config.enabled || config.target != XEMU_DSU_MOTION_MOUSE ||
+            !xemu_dsu_get_player_state(player, &dsu) ||
+            !(dsu.enabled_data_types & XEMU_DSU_DATA_MOTION) ||
+            !dsu.controller.connected) {
+            if (state->target_valid &&
+                state->target == XEMU_DSU_MOTION_MOUSE) {
+                xemu_input_reset_dsu_motion_mapper(player, config.target);
+            }
+            continue;
+        }
+        if (!xemu_input_take_dsu_motion_sample(
+                player, config.target, &dsu.controller, &dt)) {
+            continue;
+        }
+
+        /* DSU gyroscope values are in radians/second. Convert yaw and pitch
+         * into relative pointer movement and retain fractional pixels so
+         * low-rate motion stays smooth. */
+        state->mouse_remainder_x +=
+            dsu.controller.gyroscope[1] * config.horizontal_sensitivity *
+            dt * 1000.0;
+        state->mouse_remainder_y +=
+            -dsu.controller.gyroscope[0] * config.vertical_sensitivity *
+            dt * 1000.0;
+        int dx = (int)state->mouse_remainder_x;
+        int dy = (int)state->mouse_remainder_y;
+        state->mouse_remainder_x -= dx;
+        state->mouse_remainder_y -= dy;
+        if (dx != 0) {
+            qemu_input_queue_rel(NULL, INPUT_AXIS_X, dx);
+            queued = true;
+        }
+        if (dy != 0) {
+            qemu_input_queue_rel(NULL, INPUT_AXIS_Y, dy);
+            queued = true;
+        }
+        if ((dx != 0 || dy != 0) && !state->logged_mapping) {
+            fprintf(stderr,
+                    "xemu input: DSU motion player %u -> mouse "
+                    "delta={%d,%d} sensitivity={%.2f,%.2f}\n",
+                    player + 1, dx, dy, config.horizontal_sensitivity,
+                    config.vertical_sensitivity);
+            state->logged_mapping = true;
+        }
+    }
+    if (queued) {
+        qemu_input_event_sync();
+    }
+}
+
 void xemu_input_init(void)
 {
+    xemu_dsu_init();
+    xemu_input_init_dsu_controllers();
+
     if (g_config.input.background_input_capture) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
@@ -308,6 +786,10 @@ void xemu_input_init(void)
     }
 
     QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
+
+#ifdef CONFIG_UWP
+    xemu_input_scan_uwp_gamepads(true);
+#endif
 }
 
 int xemu_input_get_controller_default_bind_port(ControllerState *state, int start)
@@ -317,6 +799,11 @@ int xemu_input_get_controller_default_bind_port(ControllerState *state, int star
         SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
     } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
         snprintf(guid, sizeof(guid), "keyboard");
+#ifdef CONFIG_UWP
+    } else if (state->type == INPUT_DEVICE_UWP_GAMEPAD) {
+        snprintf(guid, sizeof(guid), "uwp-gamepad-%d",
+                 state->uwp_gamepad_index);
+#endif
     }
 
     for (int i = start; i < 4; i++) {
@@ -351,11 +838,26 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
     if (event->type == SDL_EVENT_GAMEPAD_ADDED) {
         DPRINTF("Controller Added: %d\n", event->gdevice.which);
 
+#ifdef CONFIG_UWP
+        int uwp_count = xemu_uwp_gamepad_count();
+        if (uwp_count > 0) {
+            fprintf(stderr,
+                    "xemu input: ignoring SDL gamepad add instance=%d "
+                    "because Windows.Gaming.Input reports %d native "
+                    "gamepad(s)\n",
+                    event->gdevice.which, uwp_count);
+            return;
+        }
+#endif
+
         // Attempt to open the added controller
         SDL_Gamepad *sdl_con;
         sdl_con = SDL_OpenGamepad(event->gdevice.which);
         if (sdl_con == NULL) {
-            DPRINTF("Could not open joystick %d as a Gamepad\n", event->gdevice.which);
+            fprintf(stderr,
+                    "xemu input: SDL_OpenGamepad failed instance=%d "
+                    "error='%s'\n",
+                    event->gdevice.which, SDL_GetError());
             return;
         }
 
@@ -402,7 +904,7 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
             if (port < 0) {
                 // No (additional) default mappings
                 break;
-            } else if (!xemu_input_get_bound(port)) {
+            } else if (xemu_input_port_accepts_local(port)) {
                 xemu_input_bind(port, new_con, 0);
                 did_bind = true;
                 break;
@@ -415,7 +917,7 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         // Try to bind to any open port, and if so remember the binding
         if (!did_bind && g_config.input.auto_bind) {
             for (port = 0; port < 4; port++) {
-                if (!xemu_input_get_bound(port)) {
+                if (xemu_input_port_accepts_local(port)) {
                     xemu_input_bind(port, new_con, 1);
                     did_bind = true;
                     break;
@@ -491,6 +993,10 @@ void xemu_input_update_controller(ControllerState *state)
         xemu_input_update_sdl_kbd_controller_state(state);
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_update_sdl_controller_state(state);
+#ifdef CONFIG_UWP
+    } else if (state->type == INPUT_DEVICE_UWP_GAMEPAD) {
+        xemu_input_update_uwp_gamepad_controller_state(state);
+#endif
     }
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -498,6 +1004,22 @@ void xemu_input_update_controller(ControllerState *state)
 
 void xemu_input_update_controllers(void)
 {
+    static bool dsu_was_active;
+
+    xemu_dsu_process_pending();
+    bool dsu_active = xemu_dsu_is_active();
+    if (dsu_active || dsu_was_active) {
+        /* Run once on the active -> disabled edge to unbind synthetic
+         * controllers and clear motion mapper state. */
+        xemu_input_update_dsu_motion_mouse();
+        xemu_input_sync_dsu_bindings();
+    }
+    dsu_was_active = dsu_active;
+
+#ifdef CONFIG_UWP
+    xemu_input_scan_uwp_gamepads(false);
+#endif
+
     ControllerState *iter;
     QTAILQ_FOREACH(iter, &available_controllers, entry) {
         xemu_input_update_controller(iter);
@@ -558,6 +1080,8 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
 #undef KBD_STATE
 }
 
+static void xemu_input_apply_gamepad_axis_inversion(ControllerState *state);
+
 void xemu_input_update_sdl_controller_state(ControllerState *state)
 {
     state->buttons = 0;
@@ -601,8 +1125,14 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 
 #undef SDL_GET_AXIS
 
-// FIXME: Check range
-#define INVERT_AXIS(controller_axis) \
+    xemu_input_apply_gamepad_axis_inversion(state);
+
+    // xemu_input_print_controller_state(state);
+}
+
+static void xemu_input_apply_gamepad_axis_inversion(ControllerState *state)
+{
+#define INVERT_AXIS(controller_axis)                                \
     state->axis[controller_axis] = -1 - state->axis[controller_axis]
 
     if (state->controller_map->controller_mapping.invert_axis_left_x) {
@@ -622,12 +1152,184 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
     }
 
 #undef INVERT_AXIS
-
-    // xemu_input_print_controller_state(state);
 }
+
+#ifdef CONFIG_UWP
+static bool xemu_input_uwp_mapped_button(
+    const XemuUWPGamepadState *state, int button)
+{
+    switch ((SDL_GamepadButton)button) {
+    case SDL_GAMEPAD_BUTTON_SOUTH:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_A;
+    case SDL_GAMEPAD_BUTTON_EAST:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_B;
+    case SDL_GAMEPAD_BUTTON_WEST:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_X;
+    case SDL_GAMEPAD_BUTTON_NORTH:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_Y;
+    case SDL_GAMEPAD_BUTTON_BACK:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_BACK;
+    case SDL_GAMEPAD_BUTTON_START:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_START;
+    case SDL_GAMEPAD_BUTTON_LEFT_STICK:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_LSTICK;
+    case SDL_GAMEPAD_BUTTON_RIGHT_STICK:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_RSTICK;
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_WHITE;
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_BLACK;
+    case SDL_GAMEPAD_BUTTON_DPAD_UP:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_DPAD_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_DPAD_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_DPAD_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+        return state->buttons & XEMU_UWP_GAMEPAD_BUTTON_DPAD_RIGHT;
+    default:
+        return false;
+    }
+}
+
+static int16_t xemu_input_uwp_mapped_axis(
+    const XemuUWPGamepadState *state, int axis)
+{
+    switch ((SDL_GamepadAxis)axis) {
+    case SDL_GAMEPAD_AXIS_LEFTX:
+        return state->axis[2];
+    case SDL_GAMEPAD_AXIS_LEFTY:
+        return -1 - state->axis[3];
+    case SDL_GAMEPAD_AXIS_RIGHTX:
+        return state->axis[4];
+    case SDL_GAMEPAD_AXIS_RIGHTY:
+        return -1 - state->axis[5];
+    case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
+        return state->axis[0];
+    case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
+        return state->axis[1];
+    default:
+        return 0;
+    }
+}
+
+void xemu_input_update_uwp_gamepad_controller_state(ControllerState *state)
+{
+    XemuUWPGamepadState uwp_state;
+    bool has_input = false;
+
+    state->buttons = 0;
+    memset(state->axis, 0, sizeof(state->axis));
+
+    if (!xemu_uwp_gamepad_get_state(state->uwp_gamepad_index, &uwp_state)) {
+        return;
+    }
+
+    if (state->controller_map == NULL) {
+        xemu_input_bindings_reload_map(state);
+    }
+    if (state->controller_map == NULL) {
+        return;
+    }
+
+#define UWP_MASK_BUTTON(state, btn, idx)                                \
+    (xemu_input_uwp_mapped_button(                                       \
+         &uwp_state,                                                     \
+         (state)->controller_map->controller_mapping.btn)                \
+     << idx)
+
+    state->buttons |= UWP_MASK_BUTTON(state, a, 0);
+    state->buttons |= UWP_MASK_BUTTON(state, b, 1);
+    state->buttons |= UWP_MASK_BUTTON(state, x, 2);
+    state->buttons |= UWP_MASK_BUTTON(state, y, 3);
+    state->buttons |= UWP_MASK_BUTTON(state, dpad_left, 4);
+    state->buttons |= UWP_MASK_BUTTON(state, dpad_up, 5);
+    state->buttons |= UWP_MASK_BUTTON(state, dpad_right, 6);
+    state->buttons |= UWP_MASK_BUTTON(state, dpad_down, 7);
+    state->buttons |= UWP_MASK_BUTTON(state, back, 8);
+    state->buttons |= UWP_MASK_BUTTON(state, start, 9);
+    state->buttons |= UWP_MASK_BUTTON(state, lshoulder, 10);
+    state->buttons |= UWP_MASK_BUTTON(state, rshoulder, 11);
+    state->buttons |= UWP_MASK_BUTTON(state, lstick_btn, 12);
+    state->buttons |= UWP_MASK_BUTTON(state, rstick_btn, 13);
+    state->buttons |= UWP_MASK_BUTTON(state, guide, 14);
+
+#undef UWP_MASK_BUTTON
+
+#define UWP_GET_AXIS(state, axis)                                      \
+    xemu_input_uwp_mapped_axis(                                        \
+        &uwp_state, (state)->controller_map->controller_mapping.axis)
+
+    state->axis[0] = UWP_GET_AXIS(state, axis_trigger_left);
+    state->axis[1] = UWP_GET_AXIS(state, axis_trigger_right);
+    state->axis[2] = UWP_GET_AXIS(state, axis_left_x);
+    state->axis[3] = UWP_GET_AXIS(state, axis_left_y);
+    state->axis[4] = UWP_GET_AXIS(state, axis_right_x);
+    state->axis[5] = UWP_GET_AXIS(state, axis_right_y);
+
+#undef UWP_GET_AXIS
+
+    xemu_input_apply_gamepad_axis_inversion(state);
+
+    for (int i = 0; i < CONTROLLER_AXIS__COUNT; i++) {
+        if (state->axis[i] > 3276 || state->axis[i] < -3276) {
+            has_input = true;
+        }
+    }
+    state->uwp_gamepad_last_timestamp = uwp_state.timestamp;
+
+    if (state->buttons) {
+        has_input = true;
+    }
+
+    if (has_input && !state->uwp_gamepad_logged_input) {
+        fprintf(stderr,
+                "xemu input: first Windows.Gaming.Input gamepad input "
+                "index=%d buttons=0x%04x axes={lt=%d,rt=%d,lx=%d,ly=%d,"
+                "rx=%d,ry=%d} timestamp=%" PRIu64 "\n",
+                state->uwp_gamepad_index, state->buttons,
+                state->axis[CONTROLLER_AXIS_LTRIG],
+                state->axis[CONTROLLER_AXIS_RTRIG],
+                state->axis[CONTROLLER_AXIS_LSTICK_X],
+                state->axis[CONTROLLER_AXIS_LSTICK_Y],
+                state->axis[CONTROLLER_AXIS_RSTICK_X],
+                state->axis[CONTROLLER_AXIS_RSTICK_Y],
+                state->uwp_gamepad_last_timestamp);
+        state->uwp_gamepad_logged_input = true;
+    }
+}
+#endif
 
 void xemu_input_update_rumble(ControllerState *state)
 {
+#ifdef CONFIG_UWP
+    if (state->type == INPUT_DEVICE_UWP_GAMEPAD) {
+        if (state->controller_map == NULL ||
+            !state->controller_map->enable_rumble) {
+            return;
+        }
+        if (state->uwp_last_rumble_valid &&
+            state->uwp_last_rumble_l == state->rumble_l &&
+            state->uwp_last_rumble_r == state->rumble_r) {
+            return;
+        }
+        int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (ABS(now - state->last_rumble_updated_ts) <
+            XEMU_INPUT_MIN_RUMBLE_UPDATE_INTERVAL_US) {
+            return;
+        }
+
+        xemu_uwp_gamepad_set_vibration(state->uwp_gamepad_index,
+                                       state->rumble_l, state->rumble_r);
+        state->uwp_last_rumble_l = state->rumble_l;
+        state->uwp_last_rumble_r = state->rumble_r;
+        state->uwp_last_rumble_valid = true;
+        state->last_rumble_updated_ts =
+            qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        return;
+    }
+#endif
+
     if (state->type != INPUT_DEVICE_SDL_GAMEPAD) {
         return;
     }
@@ -644,6 +1346,288 @@ void xemu_input_update_rumble(ControllerState *state)
 
     SDL_RumbleGamepad(state->sdl_gamepad, state->rumble_l, state->rumble_r, 250);
     state->last_rumble_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+}
+
+static void xemu_input_map_dsu_gamepad(const XemuDSUControllerState *dsu,
+                                       XemuInputSample *sample)
+{
+    uint16_t buttons = dsu->buttons;
+
+    if (buttons & DSU_BTN_CROSS)      sample->buttons |= CONTROLLER_BUTTON_A;
+    if (buttons & DSU_BTN_CIRCLE)     sample->buttons |= CONTROLLER_BUTTON_B;
+    if (buttons & DSU_BTN_SQUARE)     sample->buttons |= CONTROLLER_BUTTON_X;
+    if (buttons & DSU_BTN_TRIANGLE)   sample->buttons |= CONTROLLER_BUTTON_Y;
+    if (buttons & DSU_BTN_DPAD_LEFT)  sample->buttons |= CONTROLLER_BUTTON_DPAD_LEFT;
+    if (buttons & DSU_BTN_DPAD_UP)    sample->buttons |= CONTROLLER_BUTTON_DPAD_UP;
+    if (buttons & DSU_BTN_DPAD_RIGHT) sample->buttons |= CONTROLLER_BUTTON_DPAD_RIGHT;
+    if (buttons & DSU_BTN_DPAD_DOWN)  sample->buttons |= CONTROLLER_BUTTON_DPAD_DOWN;
+    if (buttons & DSU_BTN_SHARE)      sample->buttons |= CONTROLLER_BUTTON_BACK;
+    if (buttons & DSU_BTN_OPTIONS)    sample->buttons |= CONTROLLER_BUTTON_START;
+    if (buttons & DSU_BTN_L1)         sample->buttons |= CONTROLLER_BUTTON_WHITE;
+    if (buttons & DSU_BTN_R1)         sample->buttons |= CONTROLLER_BUTTON_BLACK;
+    if (buttons & DSU_BTN_L3)         sample->buttons |= CONTROLLER_BUTTON_LSTICK;
+    if (buttons & DSU_BTN_R3)         sample->buttons |= CONTROLLER_BUTTON_RSTICK;
+    if (dsu->home)                    sample->buttons |= CONTROLLER_BUTTON_GUIDE;
+
+    sample->axis[CONTROLLER_AXIS_LTRIG] =
+        dsu->left_trigger ? (int16_t)(dsu->left_trigger * 128) :
+        ((buttons & DSU_BTN_L2) ? INT16_MAX : 0);
+    sample->axis[CONTROLLER_AXIS_RTRIG] =
+        dsu->right_trigger ? (int16_t)(dsu->right_trigger * 128) :
+        ((buttons & DSU_BTN_R2) ? INT16_MAX : 0);
+    sample->axis[CONTROLLER_AXIS_LSTICK_X] = dsu->axes[0];
+    sample->axis[CONTROLLER_AXIS_LSTICK_Y] = dsu->axes[1];
+    sample->axis[CONTROLLER_AXIS_RSTICK_X] = dsu->axes[2];
+    sample->axis[CONTROLLER_AXIS_RSTICK_Y] = dsu->axes[3];
+}
+
+static void xemu_input_map_dsu_motion(unsigned player,
+                                      const XemuDSUControllerState *controller,
+                                      const XemuDSUMotionConfig *config,
+                                      XemuInputSample *sample)
+{
+    float horizontal = controller->gyroscope[1] *
+                       config->horizontal_sensitivity;
+    float vertical = -controller->gyroscope[0] *
+                     config->vertical_sensitivity;
+    int16_t axis_x = xemu_input_motion_axis(horizontal);
+    int16_t axis_y = xemu_input_motion_axis(vertical);
+
+    switch (config->target) {
+    case XEMU_DSU_MOTION_RIGHT_STICK:
+        sample->axis[CONTROLLER_AXIS_RSTICK_X] = axis_x;
+        sample->axis[CONTROLLER_AXIS_RSTICK_Y] = axis_y;
+        break;
+    case XEMU_DSU_MOTION_LEFT_STICK:
+        sample->axis[CONTROLLER_AXIS_LSTICK_X] = axis_x;
+        sample->axis[CONTROLLER_AXIS_LSTICK_Y] = axis_y;
+        break;
+    case XEMU_DSU_MOTION_DPAD:
+        if (axis_x <= -8192) {
+            sample->buttons |= CONTROLLER_BUTTON_DPAD_LEFT;
+        } else if (axis_x >= 8192) {
+            sample->buttons |= CONTROLLER_BUTTON_DPAD_RIGHT;
+        }
+        if (axis_y <= -8192) {
+            sample->buttons |= CONTROLLER_BUTTON_DPAD_UP;
+        } else if (axis_y >= 8192) {
+            sample->buttons |= CONTROLLER_BUTTON_DPAD_DOWN;
+        }
+        break;
+    case XEMU_DSU_MOTION_LIGHTGUN: {
+        XemuDSUMotionMapperState *state = &dsu_motion_mapper[player];
+        double dt;
+
+        if (xemu_input_take_dsu_motion_sample(
+                player, config->target, controller, &dt)) {
+            /* A 90-degree rotation moves across the full lightgun range at
+             * 1.0x sensitivity. The state is relative and begins centered. */
+            const double units_per_radian = 65534.0 / G_PI;
+            state->lightgun_x += horizontal * dt * units_per_radian;
+            state->lightgun_y += vertical * dt * units_per_radian;
+            state->lightgun_x = CLAMP(state->lightgun_x,
+                                      (double)INT16_MIN,
+                                      (double)INT16_MAX);
+            state->lightgun_y = CLAMP(state->lightgun_y,
+                                      (double)INT16_MIN,
+                                      (double)INT16_MAX);
+        }
+        sample->axis[CONTROLLER_AXIS_LSTICK_X] =
+            (int16_t)lrint(state->lightgun_x);
+        sample->axis[CONTROLLER_AXIS_LSTICK_Y] =
+            (int16_t)lrint(state->lightgun_y);
+        sample->buttons |= CONTROLLER_BUTTON_LIGHTGUN_ONSCREEN;
+        break;
+    }
+    case XEMU_DSU_MOTION_MOUSE:
+    default:
+        break;
+    }
+
+    XemuDSUMotionMapperState *state = &dsu_motion_mapper[player];
+    if (!state->logged_mapping &&
+        (fabsf(horizontal) >= 0.001f || fabsf(vertical) >= 0.001f)) {
+        fprintf(stderr,
+                "xemu input: DSU motion player %u -> %s "
+                "gyro={%.3f,%.3f} output={buttons=0x%04x,lx=%d,ly=%d,"
+                "rx=%d,ry=%d} sensitivity={%.2f,%.2f}\n",
+                player + 1,
+                xemu_input_dsu_motion_target_name(config->target),
+                horizontal, vertical, sample->buttons,
+                sample->axis[CONTROLLER_AXIS_LSTICK_X],
+                sample->axis[CONTROLLER_AXIS_LSTICK_Y],
+                sample->axis[CONTROLLER_AXIS_RSTICK_X],
+                sample->axis[CONTROLLER_AXIS_RSTICK_Y],
+                config->horizontal_sensitivity,
+                config->vertical_sensitivity);
+        state->logged_mapping = true;
+    }
+}
+
+static void xemu_input_merge_sample(XemuInputSample *base,
+                                    const XemuInputSample *addon)
+{
+    base->buttons |= addon->buttons;
+    base->axis[CONTROLLER_AXIS_LTRIG] =
+        MAX(base->axis[CONTROLLER_AXIS_LTRIG],
+            addon->axis[CONTROLLER_AXIS_LTRIG]);
+    base->axis[CONTROLLER_AXIS_RTRIG] =
+        MAX(base->axis[CONTROLLER_AXIS_RTRIG],
+            addon->axis[CONTROLLER_AXIS_RTRIG]);
+    for (int axis = CONTROLLER_AXIS_LSTICK_X;
+         axis < CONTROLLER_AXIS__COUNT; axis++) {
+        if (abs((int)addon->axis[axis]) > abs((int)base->axis[axis])) {
+            base->axis[axis] = addon->axis[axis];
+        }
+    }
+}
+
+bool xemu_input_get_dsu_ui_sample(XemuInputSample *out)
+{
+    bool any = false;
+
+    memset(out, 0, sizeof(*out));
+    for (unsigned player = 0; player < XEMU_DSU_MAX_PLAYERS; player++) {
+        XemuDSUPlayerState dsu;
+        XemuInputSample sample = { 0 };
+
+        if (!xemu_dsu_get_player_state(player, &dsu) ||
+            !(dsu.enabled_data_types & XEMU_DSU_DATA_GAMEPAD) ||
+            !dsu.controller.connected) {
+            continue;
+        }
+        xemu_input_map_dsu_gamepad(&dsu.controller, &sample);
+        out->buttons |= sample.buttons;
+        for (int i = 0; i < CONTROLLER_AXIS__COUNT; i++) {
+            if (abs(sample.axis[i]) > abs(out->axis[i])) {
+                out->axis[i] = sample.axis[i];
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
+bool xemu_input_get_effective_state(unsigned index, XemuInputSample *out)
+{
+    XemuDSUPlayerState dsu;
+    XemuDSUMotionConfig motion;
+    ControllerState *local;
+    bool has_gamepad;
+    bool has_motion;
+    bool uses_controller_port;
+
+    if (index >= XEMU_DSU_MAX_PLAYERS || out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+
+    local = bound_controllers[index];
+    if (local != NULL && local->type != INPUT_DEVICE_DSU_GAMEPAD) {
+        xemu_input_update_controller(local);
+        out->buttons = local->buttons;
+        memcpy(out->axis, local->axis, sizeof(out->axis));
+    }
+
+    if (!xemu_dsu_get_player_state(index, &dsu)) {
+        return local != NULL;
+    }
+
+    motion = xemu_input_get_dsu_motion_config(index);
+    has_gamepad = dsu.enabled_data_types & XEMU_DSU_DATA_GAMEPAD;
+    has_motion = motion.enabled &&
+                 (dsu.enabled_data_types & XEMU_DSU_DATA_MOTION) &&
+                 motion.target != XEMU_DSU_MOTION_MOUSE;
+    uses_controller_port = has_gamepad || has_motion ||
+                           (dsu.enabled_data_types &
+                            (XEMU_DSU_DATA_TOUCH | XEMU_DSU_DATA_MOUSE));
+    if (!uses_controller_port) {
+        return local != NULL;
+    }
+
+    if (!dsu.addon) {
+        memset(out, 0, sizeof(*out));
+    }
+
+    if (has_gamepad && dsu.controller.connected) {
+        XemuInputSample remote = { 0 };
+        xemu_input_map_dsu_gamepad(&dsu.controller, &remote);
+        xemu_input_merge_sample(out, &remote);
+    }
+
+    if (has_motion && dsu.controller.connected &&
+        (motion.target != XEMU_DSU_MOTION_LIGHTGUN ||
+         strcmp(bound_drivers[index], DRIVER_LIGHTGUN) == 0)) {
+        XemuInputSample remote_motion = { 0 };
+        xemu_input_map_dsu_motion(index, &dsu.controller, &motion,
+                                  &remote_motion);
+        xemu_input_merge_sample(out, &remote_motion);
+    } else if (!motion.enabled || !dsu.controller.connected) {
+        xemu_input_reset_dsu_motion_mapper(index, motion.target);
+    }
+
+    if (strcmp(bound_drivers[index], DRIVER_LIGHTGUN) == 0 &&
+        (dsu.enabled_data_types & XEMU_DSU_DATA_TOUCH)) {
+        XemuPointerAimResult aim;
+        const XemuDSUTouchPoint *touch = dsu.controller.touch[0].active
+                                             ? &dsu.controller.touch[0]
+                                             : &dsu.controller.touch[1];
+        bool active = dsu.controller.connected && touch->active;
+
+        xemu_pointer_aim_update_dsu_touch(
+            &dsu_pointer_aim[index], (uint16_t)touch->x,
+            (uint16_t)touch->y, active,
+            g_config.input.lightgun_smoothing,
+            g_config.input.lightgun_sensitivity,
+            (uint64_t)g_get_monotonic_time() * 1000, &aim);
+        if (active) {
+            out->axis[CONTROLLER_AXIS_LSTICK_X] = aim.axis_x;
+            out->axis[CONTROLLER_AXIS_LSTICK_Y] = aim.axis_y;
+            if (aim.onscreen) {
+                out->buttons |= CONTROLLER_BUTTON_LIGHTGUN_ONSCREEN;
+            }
+        }
+    }
+
+    if (strcmp(bound_drivers[index], DRIVER_LIGHTGUN) == 0 &&
+        (dsu.enabled_data_types & XEMU_DSU_DATA_MOUSE)) {
+        if (dsu.mouse.buttons & 0x0001) {
+            out->buttons |= CONTROLLER_BUTTON_A;
+        }
+        if (dsu.mouse.buttons & 0x0002) {
+            out->buttons |= CONTROLLER_BUTTON_B;
+        }
+        if (dsu.mouse.buttons & 0x0004) {
+            out->buttons |= CONTROLLER_BUTTON_START;
+        }
+    }
+
+    return true;
+}
+
+void xemu_input_set_rumble(unsigned index, uint16_t left, uint16_t right)
+{
+    XemuDSUPlayerState dsu;
+    ControllerState *local;
+    bool configured;
+
+    if (index >= XEMU_DSU_MAX_PLAYERS) {
+        return;
+    }
+    configured = xemu_dsu_get_player_state(index, &dsu) &&
+                 (dsu.enabled_data_types & XEMU_DSU_DATA_GAMEPAD);
+    local = bound_controllers[index];
+
+    if (local != NULL && local->type != INPUT_DEVICE_DSU_GAMEPAD &&
+        (!configured || dsu.addon)) {
+        local->rumble_l = left;
+        local->rumble_r = right;
+        xemu_input_update_rumble(local);
+    }
+    if (configured) {
+        xemu_dsu_send_rumble(index, 0, left >> 8);
+        xemu_dsu_send_rumble(index, 1, right >> 8);
+    }
 }
 
 ControllerState *xemu_input_get_bound(int index)
@@ -692,9 +1676,17 @@ void xemu_input_bind(int index, ControllerState *state, int save)
                 SDL_GUIDToString(state->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
             } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
                 snprintf(guid_buf, sizeof(guid_buf), "keyboard");
+#ifdef CONFIG_UWP
+            } else if (state->type == INPUT_DEVICE_UWP_GAMEPAD) {
+                snprintf(guid_buf, sizeof(guid_buf), "uwp-gamepad-%d",
+                         state->uwp_gamepad_index);
+#endif
             }
         }
-        xemu_settings_set_string(port_index_to_settings_key_map[index], guid_buf);
+        if (state == NULL || state->type != INPUT_DEVICE_DSU_GAMEPAD) {
+            xemu_settings_set_string(port_index_to_settings_key_map[index],
+                                     guid_buf);
+        }
         xemu_settings_set_string(port_index_to_driver_settings_key_map[index],
                                  bound_drivers[index]);
     }
@@ -941,9 +1933,17 @@ void xemu_input_reset_input_mapping(ControllerState *state)
 {
     if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         char guid[35] = { 0 };
-        SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
+        xemu_input_get_gamepad_mapping_id(state, guid, sizeof(guid));
         xemu_settings_reset_controller_mapping(guid);
     } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
         xemu_settings_reset_keyboard_mapping();
+#ifdef CONFIG_UWP
+    } else if (state->type == INPUT_DEVICE_UWP_GAMEPAD) {
+        char guid[35] = { 0 };
+        xemu_input_get_gamepad_mapping_id(state, guid, sizeof(guid));
+        xemu_settings_reset_controller_mapping(guid);
+#endif
     }
+
+    xemu_input_bindings_reload_map(state);
 }

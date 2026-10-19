@@ -90,6 +90,23 @@ static void xbox_sha1_compute(SHA1Context *ctx, XboxEEPROMVersion ver,
     sha1_result(ctx, hash);
 }
 
+bool xbox_eeprom_set_video_flags(uint8_t *eeprom, uint32_t set,
+                                 uint32_t clear)
+{
+    uint8_t *user_section = eeprom + offsetof(XboxEEPROM, user_section);
+    uint8_t *video_flags = eeprom + XBOX_EEPROM_VIDEO_FLAGS_OFFSET;
+    uint32_t flags = ldl_le_p(video_flags);
+    uint32_t updated = (flags | set) & ~clear;
+
+    if (updated == flags) {
+        return false;
+    }
+    stl_le_p(video_flags, updated);
+    stl_le_p(eeprom + offsetof(XboxEEPROM, user_checksum),
+             xbox_eeprom_crc(user_section, 0x5C));
+    return true;
+}
+
 bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver) {
     XboxEEPROM e;
     memset(&e, 0, sizeof(e));

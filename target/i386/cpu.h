@@ -171,6 +171,7 @@ typedef enum X86Seg {
 #define HF_UMIP_SHIFT       27 /* CR4.UMIP */
 #define HF_AVX_EN_SHIFT     28 /* AVX Enabled (CR4+XCR0) */
 #define HF_FPU_PC_SHIFT     29 /* FPU Precision Control */
+#define HF_SSE_DEFAULT_SHIFT 30 /* MXCSR controls are the host default */
 
 #define HF_CPL_MASK          (3 << HF_CPL_SHIFT)
 #define HF_INHIBIT_IRQ_MASK  (1 << HF_INHIBIT_IRQ_SHIFT)
@@ -199,6 +200,7 @@ typedef enum X86Seg {
 #define HF_UMIP_MASK         (1 << HF_UMIP_SHIFT)
 #define HF_AVX_EN_MASK       (1 << HF_AVX_EN_SHIFT)
 #define HF_FPU_PC_MASK       (1 << HF_FPU_PC_SHIFT)
+#define HF_SSE_DEFAULT_MASK  (1 << HF_SSE_DEFAULT_SHIFT)
 
 /* hflags2 */
 
@@ -2800,6 +2802,21 @@ void cpu_init_fp_statuses(CPUX86State *env);
 void update_fp_status(CPUX86State *env);
 void update_mxcsr_status(CPUX86State *env);
 void update_mxcsr_from_sse_status(CPUX86State *env);
+
+/*
+ * With MXCSR controls at 0x1f80 (round to nearest, no FTZ or DAZ, all
+ * exceptions masked) guest SSE arithmetic gives the same results as the
+ * host instructions under the host default MXCSR. Kept in hflags so that
+ * translations specialise on it.
+ */
+static inline void cpu_sync_sse_default_hflag(CPUX86State *env)
+{
+    if ((env->mxcsr & ~0x3fu) == 0x1f80) {
+        env->hflags |= HF_SSE_DEFAULT_MASK;
+    } else {
+        env->hflags &= ~HF_SSE_DEFAULT_MASK;
+    }
+}
 
 static inline void cpu_set_mxcsr(CPUX86State *env, uint32_t mxcsr)
 {

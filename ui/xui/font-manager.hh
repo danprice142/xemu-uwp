@@ -25,6 +25,11 @@
 #define ICON_BUTTON_X "\xef\xa4\x82"
 #define ICON_BUTTON_Y "\xef\xa4\x83"
 
+enum class FontRendererBackend {
+    OpenGL,
+    D3D12,
+};
+
 class FontManager
 {
 public:
@@ -38,8 +43,8 @@ public:
     float m_last_pixel_density;
 
     FontManager();
-    void Rebuild();
-    void Update();
+    void Rebuild(FontRendererBackend backend);
+    void Update(FontRendererBackend backend);
 };
 
 extern FontManager g_font_mgr;

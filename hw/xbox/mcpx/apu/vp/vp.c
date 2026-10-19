@@ -134,17 +134,23 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
 
-    uint64_t mask = 1LL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+    uint64_t mask = 1ULL << (v % 64);
+    if (!lock) {
+        qatomic_and(&d->vp.voice_locked[v / 64], ~mask);
+        /* The frame thread also rechecks the locks every millisecond. */
+        qemu_cond_signal(&d->cond);
+        return;
     }
 
-    qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
+    qatomic_or(&d->vp.voice_locked[v / 64], mask);
+    /*
+     * Either the frame thread checks the locks after this and leaves the
+     * voice alone, or it is already past the check: then wait until the
+     * voices it dispatched are done.
+     */
+    qemu_mutex_lock(&d->vp.dispatch_lock);
+    qemu_mutex_unlock(&d->vp.dispatch_lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -827,6 +833,26 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
             voice_off(d, v);
         }
         return 0.0f;
+    case NV_PAVS_VOICE_PAR_STATE_EFCUR_COMPLETE: {
+        /*
+         * State 8 is not among the documented envelope states 0..7 but
+         * some titles reach it.  Treat it as a completed, silent envelope
+         * rather than aborting.  The amplitude envelope owns the voice
+         * lifetime; the filter envelope simply stays off.
+         */
+        fprintf(stderr,
+                "mcpx apu: normalizing unknown envelope state 0x%x "
+                "(voice=%u, envelope=%s)\n",
+                cur, v,
+                count_mask == NV_PAVS_VOICE_CUR_ECNT_EACOUNT ?
+                    "amplitude" : "filter");
+        voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE, cur_mask,
+                       NV_PAVS_VOICE_PAR_STATE_EFCUR_OFF);
+        if (count_mask == NV_PAVS_VOICE_CUR_ECNT_EACOUNT) {
+            voice_off(d, v);
+        }
+        return 0.0f;
+    }
     default:
         fprintf(stderr, "Unknown envelope state 0x%x\n", cur);
         assert(!"Unknown envelope state");
@@ -1587,10 +1613,17 @@ static void *voice_worker_thread(void *arg)
     MCPXAPUState *d = arg;
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+    fprintf(stderr, "xemu UWP: mcpx voice worker thread started\n");
+#endif
     rcu_register_thread();
     qemu_mutex_lock(&vwd->lock);
 
     int worker_id = ctz64(vwd->workers_pending);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+    fprintf(stderr, "xemu UWP: mcpx voice worker assigned id %d\n",
+            worker_id);
+#endif
     VoiceWorker *self = &d->vp.voice_work_dispatch.workers[worker_id];
     self->queue_len = 0;
 
@@ -1731,9 +1764,11 @@ voice_work_dispatch(MCPXAPUState *d,
             return;
         }
 
+        qemu_mutex_lock(&d->vp.dispatch_lock);
         if (!any_queued_voice_locked(d)) {
             break;
         }
+        qemu_mutex_unlock(&d->vp.dispatch_lock);
 
         qemu_cond_timedwait(&d->cond, &d->lock, 1);
     }
@@ -1762,6 +1797,7 @@ voice_work_dispatch(MCPXAPUState *d,
     g_dbg.vp.total_worker_time_us = end_time - start_time;
 
     qemu_mutex_unlock(&vwd->lock);
+    qemu_mutex_unlock(&d->vp.dispatch_lock);
 }
 
 static void voice_work_init(MCPXAPUState *d)
@@ -1770,6 +1806,11 @@ static void voice_work_init(MCPXAPUState *d)
 
     int num_workers = g_config.audio.vp.num_workers ?: SDL_GetNumLogicalCPUCores();
     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+    fprintf(stderr,
+            "xemu UWP: mcpx voice_work_init requested_workers=%d selected_workers=%d\n",
+            num_workers, vwd->num_workers);
+#endif
     vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
     vwd->workers_should_exit = false;
     vwd->workers_pending = 0;
@@ -1783,11 +1824,23 @@ static void voice_work_init(MCPXAPUState *d)
     qemu_cond_init(&vwd->work_finished);
     for (int i = 0; i < vwd->num_workers; i++) {
         vwd->workers_pending |= 1 << i;
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+        fprintf(stderr, "xemu UWP: mcpx voice_work_init creating worker %d\n",
+                i);
+#endif
         qemu_thread_create(&vwd->workers[i].thread, "mcpx.voice_worker",
                            voice_worker_thread, d, QEMU_THREAD_JOINABLE);
     }
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+    fprintf(stderr,
+            "xemu UWP: mcpx voice_work_init waiting for workers, pending=0x%llx\n",
+            (unsigned long long)vwd->workers_pending);
+#endif
     qemu_cond_wait(&vwd->work_finished, &vwd->lock);
     assert(!vwd->workers_pending);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+    fprintf(stderr, "xemu UWP: mcpx voice_work_init workers ready\n");
+#endif
     qemu_mutex_unlock(&vwd->lock);
 }
 
@@ -1859,12 +1912,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
 
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
+    qemu_mutex_init(&d->vp.dispatch_lock);
     voice_work_init(d);
 }
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)
 {
     voice_work_finalize(d);
+    qemu_mutex_destroy(&d->vp.dispatch_lock);
 }
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)

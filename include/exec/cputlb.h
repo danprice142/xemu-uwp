@@ -24,6 +24,7 @@
 #include "exec/hwaddr.h"
 #include "exec/memattrs.h"
 #include "exec/vaddr.h"
+#include "exec/mmu-access-type.h"
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
 void tlb_protect_code(ram_addr_t ram_addr);
@@ -33,6 +34,21 @@ void tlb_unprotect_code(ram_addr_t ram_addr);
 #ifndef CONFIG_USER_ONLY
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length);
 void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length);
+#ifdef XBOX
+void tlb_flush_host_range(CPUState *cpu, uintptr_t start, uintptr_t length);
+void tlb_set_dyn_min_bits(CPUState *cpu, int bits);
+extern int64_t tlb_page_flushes;
+extern int64_t tlb_large_page_flushes;
+extern int64_t tlb_reset_dirty_calls;
+extern int64_t tlb_reset_dirty_walks;
+/* Guest RAM block whose writable TLB mappings tlb_reset_dirty() tracks. */
+void tlb_set_dirty_filter_ram(void *host, uint64_t size);
+int tlb_fastmem_probe(CPUState *cpu, vaddr addr,
+                      MMUAccessType access_type, int mmu_idx,
+                      void **phost, uint64_t *ram_addr);
+bool tlb_fastmem_set_dirty(CPUState *cpu, vaddr addr,
+                           uint64_t ram_addr);
+#endif
 #endif
 
 /**

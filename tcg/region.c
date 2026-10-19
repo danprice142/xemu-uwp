@@ -23,6 +23,9 @@
  */
 
 #include "qemu/osdep.h"
+#if defined(XBOX) && defined(_WIN32)
+#include "accel/tcg/xbox-fastmem.h"
+#endif
 #include "qemu/units.h"
 #include "qemu/madvise.h"
 #include "qemu/mprotect.h"
@@ -406,6 +409,9 @@ void tcg_region_initial_alloc(TCGContext *s)
 /* Call from a safe-work context */
 void tcg_region_reset_all(void)
 {
+#if defined(XBOX) && defined(_WIN32)
+    xbox_fastmem_sites_reset();
+#endif
     unsigned int n_ctxs = qatomic_read(&tcg_cur_ctxs);
     unsigned int i;
 

@@ -459,17 +459,42 @@ void qemu_process_cpu_events_common(CPUState *cpu)
     process_queued_cpu_work(cpu);
 }
 
+/*
+ * vCPU thread time halted, executing guest code, and waiting for the
+ * global lock after execution, for host-side profiling.
+ */
+int64_t qemu_vcpu_idle_us;
+int64_t qemu_vcpu_exec_us;
+int64_t qemu_vcpu_bql_us;
+/* Softmmu TLB refills, and full flushes requested by access callbacks. */
+int64_t qemu_vcpu_tlb_fills;
+int64_t qemu_mem_access_cb_flushes;
+int64_t qemu_tb_invalidates;
+int64_t qemu_tb_jmp_flushes;
+int64_t qemu_tb_jc_misses;
+int64_t qemu_tb_jc_miss_kind[3];
+uint32_t qemu_tb_jc_flag_diff;
+int64_t qemu_tb_lookup_ptrs;
+int64_t qemu_tb_gens;
+int64_t qemu_tb_loop_kind[4];
+int64_t qemu_tb_restores;
+int64_t qemu_tb_io_recompiles;
+
 void qemu_process_cpu_events(CPUState *cpu)
 {
     bool slept = false;
 
     qatomic_set(&cpu->exit_request, false);
     while (cpu_thread_is_idle(cpu)) {
+        int64_t wait_start;
+
         if (!slept) {
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
+        wait_start = g_get_monotonic_time();
         qemu_cond_wait(cpu->halt_cond, &bql);
+        qemu_vcpu_idle_us += g_get_monotonic_time() - wait_start;
     }
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);

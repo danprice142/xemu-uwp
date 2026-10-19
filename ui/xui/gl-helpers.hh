@@ -30,10 +30,13 @@ public:
 
     int w, h;
     GLuint fbo, tex;
+    // Software canvas + GPU texture state for non-OpenGL (Direct3D 12) HUDs
+    void *impl;
 
     Fbo(int width, int height);
     ~Fbo();
-    inline GLuint Texture() { return tex; }
+    // ImGui texture identifier for the rendered contents
+    uint64_t Texture();
     void Target();
     void Restore();
 };

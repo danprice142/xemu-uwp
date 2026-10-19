@@ -42,6 +42,20 @@ typedef struct gamepad_mappings GamepadMappings;
 
 extern struct config g_config;
 
+/*
+ * Xbox UWP storage presets. One USB drive (E:) or the Development Files
+ * share (D:) holds the per-system games directories and the downloaded_media
+ * tree.
+ */
+#define XEMU_UWP_DEV_FILES_GAMES_DIR "D:\\DevelopmentFiles\\Games\\xbox"
+#define XEMU_UWP_DEFAULT_GAMES_DIR "E:\\Games\\xbox"
+#define XEMU_UWP_DEV_FILES_MEDIA_DIR "D:\\DevelopmentFiles\\ES-DE\\downloaded_media"
+#define XEMU_UWP_DEFAULT_MEDIA_DIR "E:\\ES-DE\\downloaded_media"
+/* System files (boot ROM, flash, EEPROM, hard disk) sit side by side in an
+ * xemu folder, as they do in app storage. */
+#define XEMU_UWP_DEV_FILES_SYSTEM_DIR "D:\\DevelopmentFiles\\xemu"
+#define XEMU_UWP_USB_SYSTEM_DIR "E:\\xemu"
+
 // Override the default config file paths
 void xemu_settings_set_path(const char *path);
 

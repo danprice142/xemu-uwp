@@ -24,6 +24,10 @@
 #include "data/font_awesome_6_1_1_solid.min.otf.h"
 #include "data/abxy.ttf.h"
 
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+#include <imgui_impl_dx12.h>
+#endif
+
 FontManager g_font_mgr;
 
 FontManager::FontManager()
@@ -32,7 +36,7 @@ FontManager::FontManager()
     m_last_pixel_density = 1;
 }
 
-void FontManager::Rebuild()
+void FontManager::Rebuild(FontRendererBackend backend)
 {
     ImGuiIO &io = ImGui::GetIO();
 
@@ -99,15 +103,26 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
-    ImGui_ImplOpenGL3_DestroyFontsTexture();
-    ImGui_ImplOpenGL3_CreateFontsTexture();
+    switch (backend) {
+    case FontRendererBackend::OpenGL:
+#ifdef CONFIG_OPENGL
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+#endif
+        break;
+    case FontRendererBackend::D3D12:
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+        ImGui_ImplDX12_RebuildFontsTexture();
+#endif
+        break;
+    }
 }
 
-void FontManager::Update()
+void FontManager::Update(FontRendererBackend backend)
 {
     if (g_viewport_mgr.m_scale != m_last_viewport_scale ||
         g_viewport_mgr.m_pixel_density != m_last_pixel_density) {
-        Rebuild();
+        Rebuild(backend);
         m_last_viewport_scale = g_viewport_mgr.m_scale;
         m_last_pixel_density = g_viewport_mgr.m_pixel_density;
     }

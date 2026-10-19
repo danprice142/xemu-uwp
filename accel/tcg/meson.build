@@ -39,3 +39,7 @@ system_ss.add(files(
   'tcg-accel-ops-rr.c',
   'watchpoint.c',
 ))
+
+if host_os == 'windows'
+  system_ss.add(files('xbox-fastmem.c', 'xbox-prof.c'))
+endif

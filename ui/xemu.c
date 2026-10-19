@@ -44,10 +44,19 @@
 #include "system/system.h"
 #include "xui/xemu-hud.h"
 #include "xemu-input.h"
+#include "xemu-dsu.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
+#include "xemu-stream.h"
 #include "xemu-version.h"
+#include "xemu-main.h"
 #include "xemu-os-utils.h"
+#ifdef _WIN32
+#include "xemu-launch-uri.h"
+#endif
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+#include "d3d12-presenter.h"
+#endif
 
 #include "data/xemu_64x64.png.h"
 
@@ -59,6 +68,10 @@
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+#ifdef CONFIG_UWP
+#include <SDL3/SDL_system.h>
+#include "uwp-lifecycle.h"
+#endif
 
 #ifndef DEBUG_XEMU_C
 #define DEBUG_XEMU_C 0
@@ -81,7 +94,12 @@ struct xemu_console {
     int idx;
     int hidden;
     int ignore_hotkeys;
+#ifdef CONFIG_OPENGL
     SDL_GLContext winctx;
+#endif
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+    XemuD3D12Presenter *d3d12_presenter;
+#endif
     QKbdState *kbd;
 };
 
@@ -111,7 +129,11 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 static SDL_Window *m_window;
+#ifdef CONFIG_OPENGL
 static SDL_GLContext m_context;
+#endif
+static bool m_use_d3d12_presenter;
+static bool m_event_watch_registered;
 static QemuSemaphore display_init_sem;
 static QemuSemaphore display_shutdown_sem;
 static QEMUTimer *vblank_timer;
@@ -120,6 +142,15 @@ static bool qemu_exiting;
 static int exit_status;
 
 void tcg_register_init_ctx(void); // tcg.c
+
+static bool xemu_use_d3d12_presenter(void)
+{
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+    return g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D12;
+#else
+    return false;
+#endif
+}
 
 #if DEBUG_XEMU_C
 static uint64_t lock_held_acc;
@@ -143,6 +174,59 @@ void xemu_main_loop_unlock(void)
     bql_unlock();
     qemu_mutex_unlock_main_loop();
 }
+
+#ifdef CONFIG_UWP
+/* Set on the UI thread once it runs the frontend loop; suspend before then
+ * has no running VM or written drive to protect. */
+static bool uwp_ui_loop_ready;
+static bool vm_paused_for_suspend;
+
+/* The system can terminate a suspended app without notice, which loses
+ * drive image writes still held in memory and corrupts the image. Pausing
+ * the VM drains and flushes every drive, also when it is already paused. */
+void xemu_uwp_suspend_vm(void)
+{
+    bool locked = bql_locked();
+    int ret;
+
+    if (!uwp_ui_loop_ready || qatomic_read(&qemu_exiting)) {
+        return;
+    }
+
+    if (!locked) {
+        xemu_main_loop_lock();
+    }
+    vm_paused_for_suspend |= runstate_is_running();
+    ret = vm_stop(RUN_STATE_PAUSED);
+    if (!locked) {
+        xemu_main_loop_unlock();
+    }
+    fprintf(stderr, "xemu UWP: VM paused for suspend, drive flush %s\n",
+            ret < 0 ? "failed" : "done");
+    fflush(stderr);
+}
+
+void xemu_uwp_resume_vm(void)
+{
+    bool locked = bql_locked();
+
+    if (!vm_paused_for_suspend || qatomic_read(&qemu_exiting)) {
+        return;
+    }
+
+    if (!locked) {
+        xemu_main_loop_lock();
+    }
+    vm_paused_for_suspend = false;
+    if (!runstate_is_running()) {
+        vm_start();
+    }
+    if (!locked) {
+        xemu_main_loop_unlock();
+    }
+    fprintf(stderr, "xemu UWP: VM resumed\n");
+}
+#endif
 
 SDL_Window *xemu_get_window(void)
 {
@@ -629,6 +713,7 @@ static void mouse_define(DisplayChangeListener *dcl,
     }
 }
 
+#ifdef CONFIG_OPENGL
 static void xb_surface_gl_create_texture(DisplaySurface *surface)
 {
     assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
@@ -677,6 +762,7 @@ static void xb_surface_gl_destroy_texture(DisplaySurface *surface)
     glDeleteTextures(1, &surface->texture);
     surface->texture = 0;
 }
+#endif
 
 static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
                                        pixman_format_code_t format)
@@ -802,6 +888,7 @@ static void report_stats(void)
  */
 static void gl_render_frame(struct xemu_console *scon)
 {
+#ifdef CONFIG_OPENGL
     static bool rendering;
     if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
         return;
@@ -868,15 +955,137 @@ static void gl_render_frame(struct xemu_console *scon)
 #if DEBUG_XEMU_C
     report_stats();
 #endif
+#else
+    (void)scon;
+#endif
+}
+
+static void report_d3d12_presenter_error(struct xemu_console *scon,
+                                         const char *operation)
+{
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+    static char last_error[512];
+    const char *error = xemu_d3d12_presenter_get_error(scon->d3d12_presenter);
+
+    if (g_strcmp0(error, last_error) != 0) {
+        fprintf(stderr, "Direct3D 12 presenter: %s failed: %s\n",
+                operation, error);
+        g_strlcpy(last_error, error, sizeof(last_error));
+    }
+#else
+    (void)scon;
+    (void)operation;
+#endif
+}
+
+static bool d3d12_render_frame(struct xemu_console *scon)
+{
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+    static bool rendering;
+    NV2ADisplayFrame frame;
+    bool frame_acquired = false;
+    bool frame_presented = false;
+    char *screenshot_path = NULL;
+
+    if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
+        return false;
+    }
+
+    /* Before the display sync, so the frame shown is the newest one. */
+    xemu_d3d12_presenter_wait_frame_latency(scon->d3d12_presenter);
+    frame_acquired = nv2a_get_display_frame(&frame);
+    if (!frame_acquired) {
+        qatomic_set(&rendering, false);
+        return false;
+    }
+    xemu_snapshots_set_display_frame(&frame);
+
+    if (scon->d3d12_presenter == NULL) {
+        scon->d3d12_presenter =
+            xemu_d3d12_presenter_create(scon->real_window);
+    }
+
+    if (!xemu_d3d12_presenter_begin_frame(scon->d3d12_presenter, &frame)) {
+        report_d3d12_presenter_error(scon, "begin frame");
+        goto out;
+    }
+
+    if (!xemu_hud_is_initialized()) {
+        xemu_hud_init_d3d12(
+            scon->real_window,
+            xemu_d3d12_presenter_get_device(scon->d3d12_presenter),
+            xemu_d3d12_presenter_get_command_queue(scon->d3d12_presenter),
+            xemu_d3d12_presenter_get_srv_heap(scon->d3d12_presenter),
+            xemu_d3d12_presenter_get_font_srv_cpu(scon->d3d12_presenter),
+            xemu_d3d12_presenter_get_font_srv_gpu(scon->d3d12_presenter));
+    }
+
+    xemu_main_loop_lock();
+    xemu_hud_update();
+    xemu_main_loop_unlock();
+
+    xemu_hud_render_d3d12(
+        xemu_d3d12_presenter_get_command_list(scon->d3d12_presenter));
+    screenshot_path = xemu_hud_take_screenshot_path();
+    if (screenshot_path != NULL) {
+        if (!xemu_d3d12_presenter_request_screenshot(scon->d3d12_presenter,
+                                                     screenshot_path)) {
+            report_d3d12_presenter_error(scon, "request screenshot");
+        }
+        g_free(screenshot_path);
+    }
+
+    if (!xemu_d3d12_presenter_end_frame(scon->d3d12_presenter,
+                                        g_config.display.window.vsync)) {
+        report_d3d12_presenter_error(scon, "end frame");
+    } else {
+        frame_presented = true;
+    }
+
+out:
+    xemu_snapshots_set_display_frame(NULL);
+    nv2a_release_display_frame();
+    qatomic_set(&rendering, false);
+
+    /* Present() provides pacing when vsync is enabled.  Without it, a NONE
+     * bootstrap frame (HUD only, no guest scanout yet) would otherwise spin
+     * the UI thread and repeatedly synchronize with PGRAPH.  Delay only after
+     * releasing the display frame so guest rendering is never held up. */
+    if (frame.type == NV2A_DISPLAY_FRAME_NONE &&
+        !g_config.display.window.vsync) {
+        SDL_Delay(16);
+    }
+
+#if DEBUG_XEMU_C
+    report_stats();
+#endif
+    return frame_presented;
+#else
+    (void)scon;
+    return false;
+#endif
 }
 
 static bool event_watch_callback(void *userdata, SDL_Event *event)
 {
     struct xemu_console *scon = (struct xemu_console *)userdata;
 
+#ifdef CONFIG_UWP
+    xemu_uwp_lifecycle_handle_sdl_event(event);
+#endif
+
     if (event->type == SDL_EVENT_WINDOW_EXPOSED ||
         event->type == SDL_EVENT_WINDOW_RESIZED) {
-        gl_render_frame(scon);
+#if defined(CONFIG_UWP) && defined(CONFIG_D3D12)
+        if (m_use_d3d12_presenter) {
+            return true;
+        }
+#endif
+        if (m_use_d3d12_presenter) {
+            d3d12_render_frame(scon);
+        } else {
+            gl_render_frame(scon);
+        }
     }
 
     return true; // Ignored
@@ -941,6 +1150,9 @@ static void poll_events(struct xemu_console *scon)
 
     xemu_main_loop_lock();
     xemu_input_update_controllers();
+#ifdef CONFIG_UWP
+    xemu_uwp_process_activation();
+#endif
     xemu_main_loop_unlock();
 }
 
@@ -962,24 +1174,46 @@ static void display_very_early_init(DisplayOptions *o)
         exit(1);
     }
 
+#ifdef CONFIG_UWP
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr,
+                "Failed to initialize SDL audio subsystem on UWP main thread: %s\n",
+                SDL_GetError());
+    }
+#endif
+
 #ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR /* only available since SDL 2.0.8 */
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+#ifdef CONFIG_UWP
+    /* The console always reports a keyboard, so "auto" never shows the
+     * on-screen keyboard; text fields need it shown on text input. */
+    SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "1");
+#endif
+
+    m_use_d3d12_presenter = xemu_use_d3d12_presenter();
 
     // Initialize rendering context
-    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    SDL_GL_SetAttribute(
-        SDL_GL_CONTEXT_PROFILE_MASK,
-        SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    if (!m_use_d3d12_presenter) {
+#ifdef CONFIG_OPENGL
+        SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetAttribute(
+            SDL_GL_CONTEXT_PROFILE_MASK,
+            SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+#else
+        fprintf(stderr, "OpenGL presenter requested but OpenGL is disabled\n");
+        exit(1);
+#endif
+    }
 
     char *title = g_strdup_printf("xemu | v%s"
 #ifdef XEMU_DEBUG_BUILD
@@ -1021,7 +1255,11 @@ static void display_very_early_init(DisplayOptions *o)
         window_height = min_window_height;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!m_use_d3d12_presenter) {
+        window_flags = (SDL_WindowFlags)(window_flags | SDL_WINDOW_OPENGL);
+    }
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1035,31 +1273,39 @@ static void display_very_early_init(DisplayOptions *o)
     g_free(title);
     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
 
+#ifdef CONFIG_UWP
+    xemu_uwp_lifecycle_init();
+#endif
+
     const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
     if (disp_mode && (disp_mode->w < window_width || disp_mode->h < window_height)) {
         SDL_SetWindowSize(m_window, min_window_width, min_window_height);
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
 
-    m_context = SDL_GL_CreateContext(m_window);
+    if (!m_use_d3d12_presenter) {
+#ifdef CONFIG_OPENGL
+        m_context = SDL_GL_CreateContext(m_window);
 
-    if (m_context != NULL && epoxy_gl_version() < 40) {
-        SDL_GL_MakeCurrent(NULL, NULL);
-        SDL_GL_DestroyContext(m_context);
-        m_context = NULL;
-    }
+        if (m_context != NULL && epoxy_gl_version() < 40) {
+            SDL_GL_MakeCurrent(NULL, NULL);
+            SDL_GL_DestroyContext(m_context);
+            m_context = NULL;
+        }
 
-    if (m_context == NULL) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Unable to create OpenGL context",
-            "Unable to create OpenGL context. This usually means the\r\n"
-            "graphics device on this system does not support OpenGL 4.0.\r\n"
-            "\r\n"
-            "xemu cannot continue and will now exit.",
-            m_window);
-        SDL_DestroyWindow(m_window);
-        SDL_Quit();
-        exit(1);
+        if (m_context == NULL) {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                "Unable to create OpenGL context",
+                "Unable to create OpenGL context. This usually means the\r\n"
+                "graphics device on this system does not support OpenGL 4.0.\r\n"
+                "\r\n"
+                "xemu cannot continue and will now exit.",
+                m_window);
+            SDL_DestroyWindow(m_window);
+            SDL_Quit();
+            exit(1);
+        }
+#endif
     }
 
     int width, height, channels = 0;
@@ -1076,24 +1322,48 @@ static void display_very_early_init(DisplayOptions *o)
 
     fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
     fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
-    fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
-    fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
-    fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
-    fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+    if (m_use_d3d12_presenter) {
+#ifdef CONFIG_UWP
+        fprintf(stderr, "Display presenter: Direct3D 12 UWP CoreWindow\n");
+#else
+        fprintf(stderr, "Display presenter: Direct3D 12 desktop\n");
+#endif
+    } else {
+#ifdef CONFIG_OPENGL
+        fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
+        fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+        fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
+        fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+#endif
+    }
 
     // Initialize offscreen rendering context now
     nv2a_context_init();
-    SDL_GL_MakeCurrent(NULL, NULL);
+    if (!m_use_d3d12_presenter) {
+#ifdef CONFIG_OPENGL
+        SDL_GL_MakeCurrent(NULL, NULL);
+#endif
+    }
 }
 
 static void display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_XEMU);
-    display_opengl = 1;
 
+    if (m_use_d3d12_presenter) {
+        display_opengl = 0;
+        return;
+    }
+
+#ifdef CONFIG_OPENGL
+    display_opengl = 1;
     SDL_GL_MakeCurrent(m_window, m_context);
     SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
     xemu_hud_init(m_window, m_context);
+#else
+    fprintf(stderr, "OpenGL presenter requested but OpenGL is disabled\n");
+    exit(1);
+#endif
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
@@ -1110,13 +1380,19 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     int i;
 
     assert(o->type == DISPLAY_TYPE_XEMU);
+#ifdef CONFIG_OPENGL
     SDL_GL_MakeCurrent(m_window, m_context);
+#endif
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
 
     num_outputs = 1;
     scon_list = g_new0(struct xemu_console, num_outputs);
+    scon_list[0].real_window = m_window;
+#ifdef CONFIG_OPENGL
+    scon_list[0].winctx = m_context;
+#endif
     for (i = 0; i < num_outputs; i++) {
         QemuConsole *con = qemu_console_lookup_by_index(i);
         assert(con != NULL);
@@ -1144,9 +1420,6 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
 #endif
     }
 
-    scon_list[0].real_window = m_window;
-    scon_list[0].winctx = m_context;
-
     mouse_mode_notifier.notify = mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
 
@@ -1156,6 +1429,7 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     // SDL_PollEvent may block during main window resize or drag operations.
     // Register event watch to handle rendering during these operations.
     SDL_AddEventWatch(event_watch_callback, &scon_list[0]);
+    m_event_watch_registered = true;
 
     if (use_vblank_timer_thread) {
         qemu_thread_create(&vblank_thread, "vblank-timer", vblank_timer_thread,
@@ -1166,7 +1440,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     /* Tell main thread to go ahead and create the app and enter the run loop */
+#ifdef CONFIG_OPENGL
     SDL_GL_MakeCurrent(NULL, NULL);
+#endif
     qemu_sem_post(&display_init_sem);
 }
 
@@ -1176,9 +1452,26 @@ static void display_finalize(void)
         qemu_thread_join(&vblank_thread);
     }
 
-    SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
-    SDL_GL_MakeCurrent(NULL, NULL);
-    SDL_GL_DestroyContext(m_context);
+    if (m_event_watch_registered) {
+        SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
+        m_event_watch_registered = false;
+    }
+#ifdef CONFIG_UWP
+    xemu_uwp_lifecycle_shutdown();
+#endif
+    xemu_hud_cleanup();
+#if defined(CONFIG_D3D12) && defined(_WIN32)
+    if (scon_list[0].d3d12_presenter != NULL) {
+        xemu_d3d12_presenter_destroy(scon_list[0].d3d12_presenter);
+        scon_list[0].d3d12_presenter = NULL;
+    }
+#endif
+    if (!m_use_d3d12_presenter) {
+#ifdef CONFIG_OPENGL
+        SDL_GL_MakeCurrent(NULL, NULL);
+        SDL_GL_DestroyContext(m_context);
+#endif
+    }
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }
@@ -1199,6 +1492,74 @@ type_init(register_xemu_display);
 int gArgc;
 char **gArgv;
 
+#ifdef _WIN32
+static char *g_protocol_launch_on_exit_url;
+
+static void xemu_process_protocol_launch_args(int *argcp, char ***argvp)
+{
+    int argc = *argcp;
+    char **argv = *argvp;
+    XemuLaunchUri launch = { 0 };
+    int uri_index = -1;
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] != NULL && xemu_launch_uri_parse(argv[i], &launch)) {
+            uri_index = i;
+            break;
+        }
+    }
+
+    if (uri_index < 0) {
+        return;
+    }
+
+    int extra_args = launch.dvd_path != NULL && launch.dvd_path[0] != '\0' ? 2 : 0;
+    char **new_argv = g_new0(char *, argc + extra_args + 1);
+    int new_argc = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (i != uri_index) {
+            new_argv[new_argc++] = argv[i];
+        }
+    }
+
+    if (extra_args != 0) {
+        new_argv[new_argc++] = g_strdup("-dvd_path");
+        new_argv[new_argc++] = g_strdup(launch.dvd_path);
+        fprintf(stderr, "xemu URI launch DVD path: %s\n", launch.dvd_path);
+    }
+
+#ifndef CONFIG_UWP
+    /* On UWP the host's protocol activation handler opens it. */
+    if (launch.launch_on_exit != NULL && launch.launch_on_exit[0] != '\0') {
+        g_free(g_protocol_launch_on_exit_url);
+        g_protocol_launch_on_exit_url = g_strdup(launch.launch_on_exit);
+        fprintf(stderr, "xemu URI launchOnExit target: %s\n",
+                g_protocol_launch_on_exit_url);
+    }
+#endif
+
+    *argcp = new_argc;
+    *argvp = new_argv;
+    xemu_launch_uri_clear(&launch);
+}
+
+static void xemu_open_protocol_launch_on_exit(void)
+{
+    if (g_protocol_launch_on_exit_url == NULL ||
+        g_protocol_launch_on_exit_url[0] == '\0') {
+        return;
+    }
+
+    fprintf(stderr, "xemu URI launchOnExit opening: %s\n",
+            g_protocol_launch_on_exit_url);
+    if (!SDL_OpenURL(g_protocol_launch_on_exit_url)) {
+        fprintf(stderr, "xemu URI launchOnExit failed for '%s': %s\n",
+                g_protocol_launch_on_exit_url, SDL_GetError());
+    }
+}
+#endif
+
 static void *qemu_main(void *opaque)
 {
     qemu_init(gArgc, gArgv);
@@ -1213,6 +1574,35 @@ static void *qemu_main(void *opaque)
     bql_unlock();
 
     return NULL;
+}
+
+static void wait_for_display_init(void)
+{
+#ifdef CONFIG_UWP
+    unsigned wait_ms = 0;
+
+    while (qemu_sem_timedwait(&display_init_sem, 10) != 0) {
+        SDL_Event event;
+
+        while (SDL_PollEvent(&event)) {
+            /* Keep the WinRT view responsive while qemu_init reaches
+             * display_init() and posts display_init_sem.
+             */
+        }
+        wait_ms += 10;
+        if (wait_ms % 5000 == 0) {
+            fprintf(stderr,
+                    "xemu UWP: still waiting for qemu display init after "
+                    "%u ms\n",
+                    wait_ms);
+        }
+    }
+#ifdef XEMU_UWP_BOOT_TRACE
+    fprintf(stderr, "xemu UWP: qemu display init semaphore received\n");
+#endif
+#else
+    qemu_sem_wait(&display_init_sem);
+#endif
 }
 
 #ifdef _WIN32
@@ -1272,13 +1662,49 @@ static void init_sdl_app_metadata(void)
                                "https://xemu.app");
 }
 
-int main(int argc, char **argv)
+#ifdef CONFIG_UWP
+static void redirect_uwp_stdio_to_localstate(void)
+{
+    const char *local_folder = SDL_GetWinRTFSPath(SDL_WINRT_PATH_LOCAL_FOLDER);
+    if (local_folder == NULL || local_folder[0] == '\0') {
+        OutputDebugStringA("xemu UWP: SDL_GetWinRTFSPath(local folder) failed\n");
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+        return;
+    }
+
+    char *log_path = g_build_filename(local_folder, "xemu.log", NULL);
+    if (log_path == NULL) {
+        OutputDebugStringA("xemu UWP: failed to allocate LocalState log path\n");
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+        return;
+    }
+
+    if (freopen(log_path, "a", stdout) == NULL) {
+        OutputDebugStringA("xemu UWP: failed to redirect stdout to LocalState\n");
+    }
+    if (freopen(log_path, "a", stderr) == NULL) {
+        OutputDebugStringA("xemu UWP: failed to redirect stderr to LocalState\n");
+    }
+
+    /* LocalState is backed by storage, not a terminal. Buffer diagnostics so
+     * a noisy renderer path cannot turn every log line into synchronous I/O
+     * on the emulation thread. The buffers flush normally at shutdown. */
+    setvbuf(stdout, NULL, _IOFBF, 256 * 1024);
+    setvbuf(stderr, NULL, _IOFBF, 256 * 1024);
+    fprintf(stderr, "xemu UWP: logging to %s\n", log_path);
+    g_free(log_path);
+}
+#endif
+
+int xemu_main(int argc, char **argv)
 {
     QemuThread thread;
 
     setlocale(LC_NUMERIC, "C");
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(CONFIG_UWP)
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         // Launched with a console. If stdout and stderr are not associated with
         // an output stream, redirect to parent console.
@@ -1300,6 +1726,8 @@ int main(int argc, char **argv)
     }
 
     _set_error_mode(_OUT_TO_STDERR);
+#elif defined(CONFIG_UWP)
+    redirect_uwp_stdio_to_localstate();
 #endif
 
     fprintf(stderr, "xemu_version: %s\n", xemu_version);
@@ -1307,6 +1735,10 @@ int main(int argc, char **argv)
     fprintf(stderr, "xemu_date: %s\n", xemu_date);
 
     init_sdl_app_metadata();
+
+#ifdef _WIN32
+    xemu_process_protocol_launch_args(&argc, &argv);
+#endif
 
     gArgc = argc;
     gArgv = argv;
@@ -1333,6 +1765,16 @@ int main(int argc, char **argv)
     }
     atexit(xemu_settings_save);
 
+#if defined(CONFIG_UWP) && defined(CONFIG_D3D12)
+    if (g_config.display.renderer != CONFIG_DISPLAY_RENDERER_D3D12) {
+        fprintf(stderr,
+                "UWP build selected D3D12 presenter instead of unavailable "
+                "renderer %d\n",
+                g_config.display.renderer);
+        g_config.display.renderer = CONFIG_DISPLAY_RENDERER_D3D12;
+    }
+#endif
+
 #ifdef _WIN32
     if (g_config.display.setup_nvidia_profile) {
         setup_nvidia_profile();
@@ -1345,7 +1787,7 @@ int main(int argc, char **argv)
     qemu_sem_init(&display_shutdown_sem, 0);
     qemu_thread_create(&thread, "qemu_main", qemu_main,
                        NULL, QEMU_THREAD_JOINABLE);
-    qemu_sem_wait(&display_init_sem);
+    wait_for_display_init();
 
     gui_grab = 0;
     if (gui_fullscreen) {
@@ -1363,17 +1805,49 @@ int main(int argc, char **argv)
     xemu_main_loop_lock();
     xemu_input_init();
     xemu_main_loop_unlock();
+#ifdef CONFIG_UWP
+    uwp_ui_loop_ready = true;
+#endif
 
     struct xemu_console *scon = &scon_list[0];
     while (!qatomic_read(&qemu_exiting)) {
+        /* Drain DSU UDP traffic before entering poll_events(), which acquires
+         * the BQL for input/frontend mutations. Network bursts must not pause
+         * the emulated CPU. */
+        xemu_dsu_poll_network();
         poll_events(scon);
-        gl_render_frame(scon);
+        /* Stream start/stop can join network or encoder workers. Keep those
+         * waits outside the BQL held by HUD rendering so emulation continues
+         * while a broadcast is reconfigured or shut down. */
+        xemu_stream_init();
+        xemu_stream_poll();
+        if (m_use_d3d12_presenter) {
+            if (!d3d12_render_frame(scon)) {
+                /* Before the first scanout (and during renderer transitions)
+                 * no frame is available. Back off so the UI thread does not
+                 * spin on frame acquisition and contend with the emulation
+                 * thread. */
+                SDL_Delay(16);
+            }
+        } else {
+            gl_render_frame(scon);
+        }
     }
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);
+#ifdef _WIN32
+    xemu_open_protocol_launch_on_exit();
+#endif
     display_finalize();
     return exit_status;
 }
+
+#ifndef CONFIG_UWP
+int main(int argc, char **argv)
+{
+    return xemu_main(argc, argv);
+}
+#endif
 
 void xemu_eject_disc(Error **errp)
 {

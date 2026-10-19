@@ -22,6 +22,9 @@
 
 #include "xemu-input.h"
 #include <SDL3/SDL.h>
+#ifdef XEMU_INPUT_UWP
+#include "uwp-gamepad.h"
+#endif
 
 enum class RebindEventResult {
     Ignore,
@@ -37,6 +40,10 @@ protected:
 
 public:
     virtual RebindEventResult ConsumeRebindEvent(SDL_Event *event) = 0;
+    virtual RebindEventResult Poll()
+    {
+        return RebindEventResult::Ignore;
+    }
 
     int GetTableRow() const
     {
@@ -68,5 +75,19 @@ public:
     {
     }
 };
+
+#ifdef XEMU_INPUT_UWP
+class ControllerUWPGamepadRebindingMap : public virtual RebindingMap {
+    ControllerState *m_state;
+    XemuUWPGamepadState m_initial_state;
+    bool m_has_initial_state;
+    uint16_t m_seen_button;
+
+public:
+    RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;
+    RebindEventResult Poll() override;
+    ControllerUWPGamepadRebindingMap(int table_row, ControllerState *state);
+};
+#endif
 
 #endif // XEMU_CONTROLLERS_H

@@ -130,6 +130,11 @@ static void win_stdio_thread_wait_func(void *opaque)
 
 static void qemu_chr_set_echo_win_stdio(Chardev *chr, bool echo)
 {
+#ifdef CONFIG_UWP
+    /* Native UWP apps do not have a Win32 console to reconfigure. */
+    (void)chr;
+    (void)echo;
+#else
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(chr);
     DWORD              dwMode = 0;
 
@@ -140,6 +145,7 @@ static void qemu_chr_set_echo_win_stdio(Chardev *chr, bool echo)
     } else {
         SetConsoleMode(stdio->hStdIn, dwMode & ~ENABLE_ECHO_INPUT);
     }
+#endif
 }
 
 static void qemu_chr_open_stdio(Chardev *chr,
@@ -147,6 +153,14 @@ static void qemu_chr_open_stdio(Chardev *chr,
                                 bool *be_opened,
                                 Error **errp)
 {
+#ifdef CONFIG_UWP
+    (void)chr;
+    (void)backend;
+    (void)be_opened;
+    error_setg(errp,
+               "stdio chardev is not available in a UWP app container; "
+               "use file, null, ringbuf or socket");
+#else
     ChardevStdio *opts = backend->u.stdio.data;
     bool stdio_allow_signal = !opts->has_signal || opts->signal;
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(chr);
@@ -217,10 +231,12 @@ err2:
     CloseHandle(stdio->hInputDoneEvent);
 err1:
     qemu_del_wait_object(stdio->hStdIn, NULL, NULL);
+#endif
 }
 
 static void char_win_stdio_finalize(Object *obj)
 {
+#ifndef CONFIG_UWP
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(obj);
 
     if (stdio->hStdIn != INVALID_HANDLE_VALUE) {
@@ -235,10 +251,16 @@ static void char_win_stdio_finalize(Object *obj)
     if (stdio->hInputThread != INVALID_HANDLE_VALUE) {
         TerminateThread(stdio->hInputThread, 0);
     }
+#endif
 }
 
 static int win_stdio_write(Chardev *chr, const uint8_t *buf, int len)
 {
+#ifdef CONFIG_UWP
+    (void)chr;
+    (void)buf;
+    return 0;
+#else
     HANDLE  hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD   dwSize;
     int     len1;
@@ -254,6 +276,7 @@ static int win_stdio_write(Chardev *chr, const uint8_t *buf, int len)
     }
 
     return len - len1;
+#endif
 }
 
 static void char_win_stdio_class_init(ObjectClass *oc, const void *data)

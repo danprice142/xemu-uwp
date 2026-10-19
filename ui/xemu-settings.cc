@@ -33,6 +33,7 @@
 
 #include "xemu-controllers.h"
 #include "xemu-settings.h"
+#include "ui/xemu-screenscraper.h"
 
 #define DEFINE_CONFIG_TREE
 #include "xemu-config.h"
@@ -202,6 +203,28 @@ bool xemu_settings_load(void)
     }
 
     config_tree.store_to_struct(&g_config);
+#ifdef CONFIG_UWP
+    /* Xbox: default the game library to the USB storage layout
+     * (E:\Games\<system>). */
+    if (g_config.general.games_dir == NULL ||
+        g_config.general.games_dir[0] == '\0') {
+        xemu_settings_set_string(&g_config.general.games_dir,
+                                 XEMU_UWP_DEFAULT_GAMES_DIR);
+    }
+    /* Best effort: the USB drive may not be attached yet. */
+    g_mkdir_with_parents(g_config.general.games_dir, 0755);
+    for (const char *file : { g_config.sys.files.bootrom_path,
+                              g_config.sys.files.flashrom_path,
+                              g_config.sys.files.eeprom_path,
+                              g_config.sys.files.hdd_path }) {
+        if (file != NULL && file[0] != '\0') {
+            gchar *folder = g_path_get_dirname(file);
+            g_mkdir_with_parents(folder, 0755);
+            g_free(folder);
+        }
+    }
+#endif
+    xemu::screenscraper::sync_settings_from_config();
 
     return success;
 }

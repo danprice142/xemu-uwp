@@ -28,6 +28,8 @@ typedef struct XBOX_PMRegs {
     MemoryRegion io;
     MemoryRegion io_gpe;
     MemoryRegion io_gpio;
+    /* Last television aspect written by the kernel (5 means 16:9). */
+    uint8_t gpio_aspect;
 
     qemu_irq irq;
 } XBOX_PMRegs;

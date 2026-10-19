@@ -3342,6 +3342,11 @@ void tcg_optimize(TCGContext *s)
             finish_ebb(&ctx);
             done = true;
             break;
+        case INDEX_op_xbox_sse:
+            /* Rewrites env memory that loads may have been forwarded from. */
+            remove_mem_copy_all(&ctx);
+            done = finish_folding(&ctx, op);
+            break;
         default:
             done = finish_folding(&ctx, op);
             break;

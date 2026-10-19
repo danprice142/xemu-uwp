@@ -170,6 +170,8 @@ DEF(sqrt_f32, 1, 1, 0, TCG_OPF_FP)
 DEF(sqrt_f64, 1, 1, 0, TCG_OPF_FP)
 DEF(sub_f32, 1, 2, 0, TCG_OPF_FP)
 DEF(sub_f64, 1, 2, 0, TCG_OPF_FP)
+/* One x86 SSE arithmetic insn on env registers: env; opcode, dst, src. */
+DEF(xbox_sse, 0, 1, 3, TCG_OPF_SIDE_EFFECTS)
 
 /* Host vector support.  */
 

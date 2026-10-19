@@ -40,6 +40,24 @@ void Slider(const char *str_id, float *v, const char *description = nullptr);
 void FilePicker(const char *str_id, const char *current_path,
                 const SDL_DialogFileFilter *filters, int nfilters, bool dir,
                 std::function<void(const char *new_path)> on_select);
+// Xbox-style storage location chooser: Development files / USB storage /
+// Custom folder (opens the folder picker).
+void StorageLocationSelector(const char *str_id, const char *current_path,
+                             const char *development_files_path,
+                             const char *usb_storage_path,
+                             std::function<void(const char *new_path)> on_select);
+// The same chooser for a file: the storage presets keep the file name inside
+// their folder (default_file_name when none is set); Custom file opens the
+// file picker.
+// Call right after a text field: A (activate) then starts text entry and the
+// on-screen keyboard, as the dedicated text input button does.
+void TextFieldActivateWithA();
+void StorageFileSelector(const char *str_id, const char *current_path,
+                         const char *development_files_dir,
+                         const char *usb_storage_dir,
+                         const char *default_file_name,
+                         const SDL_DialogFileFilter *filters, int nfilters,
+                         std::function<void(const char *new_path)> on_select);
 void DrawComboChevron();
 void PrepareComboTitleDescription(const char *label, const char *description,
                                   float combo_size_ratio);

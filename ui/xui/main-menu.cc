@@ -31,14 +31,27 @@
 #include "qapi/error.h"
 #include "actions.hh"
 
+#include <algorithm>
+
 #include "../xemu-input.h"
+#include "../xemu-dsu.h"
 #include "../xemu-notifications.h"
 #include "../xemu-settings.h"
 #include "../xemu-monitor.h"
 #include "../xemu-version.h"
 #include "../xemu-net.h"
+#include "../xemu-stream.h"
 #include "../xemu-os-utils.h"
 #include "../xemu-xbe.h"
+#include "../xemu-game-library.h"
+#include "../xemu-screenscraper.h"
+
+#ifdef CONFIG_UWP
+#include "../uwp-password-vault.h"
+
+#include <glib/gstdio.h>
+#include <thread>
+#endif
 
 #include "../thirdparty/fatx/fatx.h"
 
@@ -53,7 +66,7 @@ void MainMenuTabView::Draw()
 
 void MainMenuGeneralView::Draw()
 {
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(CONFIG_UWP)
     SectionTitle("Updates");
     Toggle("Check for updates", &g_config.general.updates.check,
            "Check for updates whenever xemu is opened");
@@ -65,20 +78,338 @@ void MainMenuGeneralView::Draw()
            "Use hardware-accelerated floating point emulation (requires restart)");
 #endif
 
-    Toggle("Cache shaders to disk", &g_config.perf.cache_shaders,
-           "Reduce stutter in games by caching previously generated shaders");
+    bool shader_settings_changed =
+        Toggle("Cache shaders to disk", &g_config.perf.cache_shaders,
+               "Reduce stutter in games by caching previously generated "
+               "shaders");
+    ImGui::BeginDisabled(!g_config.perf.cache_shaders);
+    shader_settings_changed |=
+        Toggle("Precompile shaders", &g_config.perf.precompile_shaders,
+               "Compile a game's previously seen shaders when it starts");
+    ImGui::BeginDisabled(!g_config.perf.precompile_shaders);
+    Toggle("Wait for shaders before starting",
+           &g_config.perf.precompile_shaders_wait,
+           "Show a progress screen at launch until shaders are ready; B "
+           "starts the game early");
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (shader_settings_changed) {
+        nv2a_shader_cache_settings_changed();
+    }
 
     SectionTitle("Miscellaneous");
+    Toggle("Show game library at launch", &g_config.general.library_on_launch,
+           "Open the game library instead of starting the console");
     Toggle("Skip startup animation", &g_config.general.skip_boot_anim,
            "Skip the full Xbox boot animation sequence");
     FilePicker("Screenshot output directory", g_config.general.screenshot_dir,
                nullptr, 0, true, [](const char *path) {
                    xemu_settings_set_string(&g_config.general.screenshot_dir, path);
                });
+#ifdef CONFIG_UWP
+    StorageLocationSelector(
+        "Games directory", g_config.general.games_dir,
+        XEMU_UWP_DEV_FILES_GAMES_DIR, XEMU_UWP_DEFAULT_GAMES_DIR,
+        [](const char *path) {
+            if (path && *path) {
+                g_mkdir_with_parents(path, 0755);
+            }
+            xemu_settings_set_string(&g_config.general.games_dir, path);
+            xemu_game_library_refresh();
+        });
+#else
     FilePicker("Games directory", g_config.general.games_dir, nullptr, 0, true,
                [](const char *path) {
                    xemu_settings_set_string(&g_config.general.games_dir, path);
                });
+#endif
+
+#ifdef CONFIG_UWP
+    SectionTitle("ScreenScraper");
+
+    static constexpr const char *kScreenScraperVaultResource =
+        "xemu/screenscraper";
+    static bool credentials_initialized = false;
+    static bool password_saved = false;
+    static std::string username;
+    static std::string password;
+    static std::string credential_status;
+
+    if (!credentials_initialized) {
+        username = g_config.general.screenscraper.username
+            ? g_config.general.screenscraper.username
+            : "";
+        char *error = nullptr;
+        password_saved = !username.empty() && xemu_uwp_password_vault_has(
+            kScreenScraperVaultResource, username.c_str(), &error);
+        if (error != nullptr) {
+            credential_status = error;
+            g_free(error);
+        }
+        credentials_initialized = true;
+    }
+
+    ImGui::TextUnformatted("Username");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputTextWithHint("##screenscraper_username",
+                                 "ScreenScraper username", &username)) {
+        xemu_settings_set_string(&g_config.general.screenscraper.username,
+                                 username.c_str());
+        password_saved = false;
+        credential_status.clear();
+    }
+    TextFieldActivateWithA();
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        char *error = nullptr;
+        password_saved = !username.empty() && xemu_uwp_password_vault_has(
+            kScreenScraperVaultResource, username.c_str(), &error);
+        if (error != nullptr) {
+            credential_status = error;
+        }
+        g_free(error);
+        xemu_game_library_screenscraper_settings_changed();
+    }
+
+    ImGui::TextUnformatted("Password");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint(
+        "##screenscraper_password",
+        password_saved ? "Saved in Windows Password Vault"
+                       : "ScreenScraper password",
+        &password, ImGuiInputTextFlags_Password);
+    TextFieldActivateWithA();
+
+    bool can_save = !username.empty() && !password.empty();
+    ImGui::BeginDisabled(!can_save);
+    if (ImGui::Button("Save credentials")) {
+        char *error = nullptr;
+        if (xemu_uwp_password_vault_store(kScreenScraperVaultResource,
+                                          username.c_str(),
+                                          password.c_str(), &error)) {
+            password_saved = true;
+            credential_status = "Password saved in Windows Password Vault";
+            std::fill(password.begin(), password.end(), '\0');
+            password.clear();
+            xemu_game_library_screenscraper_settings_changed();
+        } else if (error != nullptr) {
+            credential_status = error;
+        }
+        g_free(error);
+    }
+    ImGui::EndDisabled();
+
+    if (password_saved) {
+        ImGui::SameLine();
+        if (ImGui::Button("Remove saved password")) {
+            char *error = nullptr;
+            if (xemu_uwp_password_vault_remove(kScreenScraperVaultResource,
+                                               username.c_str(),
+                                               &error)) {
+                password_saved = false;
+                credential_status = "Saved password removed";
+                xemu_game_library_screenscraper_settings_changed();
+            } else if (error != nullptr) {
+                credential_status = error;
+            }
+            g_free(error);
+        }
+    }
+
+    if (username.empty() || !password_saved) {
+        ImGui::TextWrapped("Artwork and game details are only downloaded "
+                           "with your own ScreenScraper account.");
+    }
+
+    if (!credential_status.empty()) {
+        ImGui::TextWrapped("%s", credential_status.c_str());
+    }
+
+    {
+        static std::string media_dir_display;
+        const char *configured_media_dir =
+            g_config.general.screenscraper.media_dir;
+        media_dir_display = (configured_media_dir && *configured_media_dir)
+                                ? configured_media_dir
+                                : xemu::screenscraper::default_media_root();
+        StorageLocationSelector(
+            "Downloaded media location", media_dir_display.c_str(),
+            XEMU_UWP_DEV_FILES_MEDIA_DIR, XEMU_UWP_DEFAULT_MEDIA_DIR,
+            [](const char *path) {
+                if (path && *path) {
+                    std::string system_dir = std::string(path) + "\\xbox";
+                    g_mkdir_with_parents(system_dir.c_str(), 0755);
+                }
+                xemu_settings_set_string(
+                    &g_config.general.screenscraper.media_dir, path);
+                xemu::screenscraper::sync_settings_from_config();
+                xemu_game_library_screenscraper_settings_changed();
+            });
+    }
+
+    {
+        static constexpr const char *kBoxArtTypes =
+            "2D box\0"
+            "3D box\0"
+            "Mix image v1\0"
+            "Mix image v2\0"
+            "Fan art\0"
+            "Screenshot\0"
+            "Game logo (HD preferred)\0"
+            "2D box back\0"
+            "Disc\0";
+        auto &scraper = g_config.general.screenscraper;
+        auto &media = scraper.media;
+
+        // A displayed media type is always downloaded as well.
+        auto enable_box_art_download = [&media](int style) {
+            switch (style) {
+            case xemu::screenscraper::kBoxArt3D:
+                media.box_3d = true;
+                break;
+            case xemu::screenscraper::kBoxArtMixV1:
+                media.mix_v1 = true;
+                break;
+            case xemu::screenscraper::kBoxArtMixV2:
+                media.mix_v2 = true;
+                break;
+            case xemu::screenscraper::kBoxArtFanArt:
+                media.fan_art = true;
+                break;
+            case xemu::screenscraper::kBoxArtScreenshot:
+                media.screenshots = true;
+                break;
+            case xemu::screenscraper::kBoxArtLogo:
+                media.wheels = true;
+                break;
+            case xemu::screenscraper::kBoxArtBack:
+                media.box_back = true;
+                break;
+            case xemu::screenscraper::kBoxArtDisc:
+                media.physical_media = true;
+                break;
+            default:
+                media.box_front = true;
+                break;
+            }
+        };
+
+        SectionTitle("Library artwork");
+        int box_art = scraper.box_art_style;
+        if (ChevronCombo("Game list box art", &box_art, kBoxArtTypes,
+                         "Artwork shown for each game in the library row")) {
+            scraper.box_art_style = (CONFIG_GENERAL_SCREENSCRAPER_BOX_ART_STYLE)box_art;
+            enable_box_art_download(box_art);
+            xemu_game_library_screenscraper_settings_changed();
+        }
+        int large_box_art = scraper.large_box_art_style;
+        if (ChevronCombo("Large box art", &large_box_art, kBoxArtTypes,
+                         "Artwork shown beside the selected game's details")) {
+            scraper.large_box_art_style =
+                (CONFIG_GENERAL_SCREENSCRAPER_LARGE_BOX_ART_STYLE)large_box_art;
+            enable_box_art_download(large_box_art);
+            xemu_game_library_screenscraper_settings_changed();
+        }
+        int background = scraper.background;
+        if (ChevronCombo("Dynamic background", &background,
+                         "Off\0"
+                         "Fan art\0"
+                         "Screenshot\0"
+                         "Video\0"
+                         "Mix image v1\0"
+                         "Mix image v2\0",
+                         "Artwork shown behind the library for the selected "
+                         "game")) {
+            scraper.background = (CONFIG_GENERAL_SCREENSCRAPER_BACKGROUND)background;
+            switch (background) {
+            case xemu::screenscraper::kBackgroundFanArt:
+                media.fan_art = true;
+                break;
+            case xemu::screenscraper::kBackgroundScreenshot:
+                media.screenshots = true;
+                break;
+            case xemu::screenscraper::kBackgroundVideo:
+                media.videos = true;
+                break;
+            case xemu::screenscraper::kBackgroundMixV1:
+                media.mix_v1 = true;
+                break;
+            case xemu::screenscraper::kBackgroundMixV2:
+                media.mix_v2 = true;
+                break;
+            default:
+                break;
+            }
+            xemu_game_library_screenscraper_settings_changed();
+        }
+
+        SectionTitle("Artwork downloads");
+        bool media_changed = false;
+        media_changed |= Toggle("2D box", &media.box_front);
+        media_changed |= Toggle("3D box", &media.box_3d);
+        media_changed |= Toggle("2D box back", &media.box_back);
+        media_changed |= Toggle("Game logo (HD preferred)", &media.wheels);
+        media_changed |= Toggle("Disc", &media.physical_media);
+        media_changed |= Toggle("Mix image v1", &media.mix_v1);
+        media_changed |= Toggle("Mix image v2", &media.mix_v2);
+        media_changed |= Toggle("Fan art", &media.fan_art);
+        media_changed |= Toggle("Screenshot", &media.screenshots);
+        media_changed |= Toggle("Video", &media.videos,
+                                "Video previews use more storage and "
+                                "bandwidth");
+        if (media_changed) {
+            xemu_game_library_screenscraper_settings_changed();
+        }
+
+        Toggle("Overwrite existing assets", &scraper.overwrite_assets,
+               "Library downloads replace saved game details and artwork");
+
+        // The download runs on library workers; this only polls progress.
+        static bool download_needs_credentials = false;
+        bool have_credentials = !username.empty() && password_saved;
+        XemuGameLibraryDownloadStatus download;
+        xemu_game_library_download_status(&download);
+        ImGui::BeginDisabled(download.running);
+        if (ImGui::Button("Download library assets")) {
+            download_needs_credentials = !have_credentials;
+            if (have_credentials) {
+                xemu_game_library_download_assets(
+                    scraper.overwrite_assets,
+                    [](uint32_t total, uint32_t failed, void *) {
+                        std::string message;
+                        if (total == 0) {
+                            message = "No games to download artwork for";
+                        } else if (failed == 0) {
+                            message = string_format(
+                                "Artwork downloaded for %u game%s", total,
+                                total == 1 ? "" : "s");
+                        } else {
+                            message = string_format(
+                                "Artwork downloaded for %u of %u games",
+                                total - failed, total);
+                        }
+                        RunOnMainThread([message]() {
+                            xemu_queue_notification(message.c_str());
+                        });
+                    },
+                    nullptr);
+            }
+        }
+        ImGui::EndDisabled();
+        if (download.running) {
+            if (download.total == 0) {
+                ImGui::TextUnformatted("Preparing library download...");
+            } else {
+                ImGui::Text("%s: %u of %u",
+                            download.identifying ? "Identifying games"
+                                                 : "Downloading artwork",
+                            download.done, download.total);
+            }
+        } else if (download_needs_credentials && !have_credentials) {
+            ImGui::TextWrapped("Save your ScreenScraper username and "
+                               "password first");
+        }
+    }
+#endif
     // toggle("Throttle DVD/HDD speeds", &g_config.general.throttle_io,
     //        "Limit DVD/HDD throughput to approximate Xbox load times");
 }
@@ -104,6 +435,11 @@ bool MainMenuInputView::IsInputRebinding()
 
 void MainMenuInputView::Draw()
 {
+    if (m_rebinding &&
+        m_rebinding->Poll() == RebindEventResult::Complete) {
+        m_rebinding = nullptr;
+    }
+
     SectionTitle("Controllers");
     ImGui::PushFont(g_font_mgr.m_menu_font_small);
 
@@ -120,10 +456,14 @@ void MainMenuInputView::Draw()
     // Dimensions of XMU
     float xmu_x = 0, xmu_x_stride = 256, xmu_y = 0;
     float xmu_w = 256, xmu_h = 256;
+    bool use_gl_previews = controller_fbo != NULL && xmu_fbo != NULL;
+    ImTextureID id = 0;
 
     // Setup rendering to fbo for controller and port images
-    controller_fbo->Target();
-    ImTextureID id = (ImTextureID)(intptr_t)controller_fbo->Texture();
+    if (use_gl_previews) {
+        controller_fbo->Target();
+        id = (ImTextureID)(intptr_t)controller_fbo->Texture();
+    }
 
     //
     // Render buttons with icons of the Xbox style port sockets with
@@ -159,12 +499,21 @@ void MainMenuInputView::Draw()
                               is_selected ? color_active : color_inactive);
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                             g_viewport_mgr.Scale(ImVec2(port_padding, port_padding)));
-        bool activated = ImGui::ImageButton(
-            "port_image_button",
-            id,
-            ImVec2(b_w * g_viewport_mgr.m_scale, b_h * g_viewport_mgr.m_scale),
-            ImVec2(x / t_w, (b_y + b_h) / t_h),
-            ImVec2((x + b_w) / t_w, b_y / t_h));
+        bool activated;
+        if (use_gl_previews) {
+            activated = ImGui::ImageButton(
+                "port_image_button",
+                id,
+                ImVec2(b_w * g_viewport_mgr.m_scale,
+                       b_h * g_viewport_mgr.m_scale),
+                ImVec2(x / t_w, (b_y + b_h) / t_h),
+                ImVec2((x + b_w) / t_w, b_y / t_h));
+        } else {
+            activated = ImGui::InvisibleButton(
+                "port_preview_button",
+                ImVec2(b_w * g_viewport_mgr.m_scale,
+                       b_h * g_viewport_mgr.m_scale));
+        }
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
 
@@ -181,7 +530,9 @@ void MainMenuInputView::Draw()
             port_color = 0x81dc8a00;
         }
 
-        RenderControllerPort(x, b_y, i, port_color);
+        if (use_gl_previews) {
+            RenderControllerPort(x, b_y, i, port_color);
+        }
 
         ImGui::PopID();
         ImGui::NextColumn();
@@ -200,6 +551,8 @@ void MainMenuInputView::Draw()
         driver = DRIVER_DUKE_DISPLAY_NAME;
     else if (strcmp(driver, DRIVER_S) == 0)
         driver = DRIVER_S_DISPLAY_NAME;
+    else if (strcmp(driver, DRIVER_LIGHTGUN) == 0)
+        driver = DRIVER_LIGHTGUN_DISPLAY_NAME;
 
     ImGui::Columns(2, "", false);
     ImGui::SetColumnWidth(0, ImGui::GetWindowWidth()*0.25);
@@ -211,9 +564,11 @@ void MainMenuInputView::Draw()
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::BeginCombo("###InputDrivers", driver,
                           ImGuiComboFlags_NoArrowButton)) {
-        const char *available_drivers[] = { DRIVER_DUKE, DRIVER_S };
+        const char *available_drivers[] = { DRIVER_DUKE, DRIVER_S,
+                                            DRIVER_LIGHTGUN };
         const char *driver_display_names[] = { DRIVER_DUKE_DISPLAY_NAME,
-                                               DRIVER_S_DISPLAY_NAME };
+                                               DRIVER_S_DISPLAY_NAME,
+                                               DRIVER_LIGHTGUN_DISPLAY_NAME };
         bool is_selected = false;
         int num_drivers = sizeof(driver_display_names) / sizeof(driver_display_names[0]);
         for (int i = 0; i < num_drivers; i++) {
@@ -318,13 +673,19 @@ void MainMenuInputView::Draw()
     // Render controller image
     //
     bool device_selected = false;
+    static ControllerState disconnected_state{};
+    ControllerState *preview_state = bound_state;
 
     if (bound_state) {
         device_selected = true;
-        RenderController(0, 0, 0x81dc8a00, 0x0f0f0f00, bound_state);
+        if (use_gl_previews) {
+            RenderController(0, 0, 0x81dc8a00, 0x0f0f0f00, bound_state);
+        }
     } else {
-        static ControllerState state{};
-        RenderController(0, 0, 0x1f1f1f00, 0x0f0f0f00, &state);
+        preview_state = &disconnected_state;
+        if (use_gl_previews) {
+            RenderController(0, 0, 0x1f1f1f00, 0x0f0f0f00, preview_state);
+        }
     }
 
     ImVec2 cur = ImGui::GetCursorPos();
@@ -340,24 +701,39 @@ void MainMenuInputView::Draw()
                    controller_height * g_viewport_mgr.m_scale);
     }
 
-    ImGui::SetCursorPosX(
-        ImGui::GetCursorPosX() +
-        (int)((ImGui::GetColumnWidth() - controller_display_size.x) / 2.0));
+    ImVec2 pos;
+    if (use_gl_previews) {
+        ImGui::SetCursorPosX(
+            ImGui::GetCursorPosX() +
+            (int)((ImGui::GetColumnWidth() - controller_display_size.x) / 2.0));
 
-    ImGui::Image(id,
-        controller_display_size,
-        ImVec2(0, controller_height/t_h),
-        ImVec2(controller_width/t_w, 0));
-    ImVec2 pos = ImGui::GetCursorPos();
-    if (!device_selected) {
-        const char *msg = "Please select an available input device";
-        ImVec2 dim = ImGui::CalcTextSize(msg);
-        ImGui::SetCursorPosX(cur.x + (controller_display_size.x-dim.x)/2);
-        ImGui::SetCursorPosY(cur.y + (controller_display_size.y-dim.y)/2);
-        ImGui::Text("%s", msg);
+        ImGui::Image(id,
+            controller_display_size,
+            ImVec2(0, controller_height/t_h),
+            ImVec2(controller_width/t_w, 0));
+        pos = ImGui::GetCursorPos();
+        if (!device_selected) {
+            const char *msg = "Please select an available input device";
+            ImVec2 dim = ImGui::CalcTextSize(msg);
+            ImGui::SetCursorPosX(cur.x + (controller_display_size.x-dim.x)/2);
+            ImGui::SetCursorPosY(cur.y + (controller_display_size.y-dim.y)/2);
+            ImGui::Text("%s", msg);
+        }
+        controller_fbo->Restore();
+    } else {
+        ImGui::SetCursorPosX(
+            ImGui::GetCursorPosX() +
+            (int)((ImGui::GetColumnWidth() - controller_display_size.x) / 2.0));
+        ImGui::InvisibleButton("controller_preview", controller_display_size);
+        pos = ImGui::GetCursorPos();
+        if (!device_selected) {
+            const char *msg = "Please select an available input device";
+            ImVec2 dim = ImGui::CalcTextSize(msg);
+            ImGui::SetCursorPosX(cur.x + (controller_display_size.x-dim.x)/2);
+            ImGui::SetCursorPosY(cur.y + (controller_display_size.y-dim.y)/2);
+            ImGui::Text("%s", msg);
+        }
     }
-
-    controller_fbo->Restore();
 
     ImGui::PopFont();
     ImGui::SetCursorPos(pos);
@@ -371,8 +747,10 @@ void MainMenuInputView::Draw()
                             g_viewport_mgr.Scale(ImVec2(0, 12)));
         ImGui::Columns(2, "mixed", false);
 
-        xmu_fbo->Target();
-        id = (ImTextureID)(intptr_t)xmu_fbo->Texture();
+        if (use_gl_previews) {
+            xmu_fbo->Target();
+            id = (ImTextureID)(intptr_t)xmu_fbo->Texture();
+        }
 
         static const SDL_DialogFileFilter img_file_filters[] = {
             { ".img Files", "img" },
@@ -453,11 +831,13 @@ void MainMenuInputView::Draw()
                 float y = xmu_y;
 
                 XmuState *xmu = (XmuState *)bound_state->peripherals[i];
-                if (xmu->filename != NULL && strlen(xmu->filename) > 0) {
-                    RenderXmu(x, y, 0x81dc8a00, 0x0f0f0f00);
+                if (use_gl_previews) {
+                    if (xmu->filename != NULL && strlen(xmu->filename) > 0) {
+                        RenderXmu(x, y, 0x81dc8a00, 0x0f0f0f00);
 
-                } else {
-                    RenderXmu(x, y, 0x1f1f1f00, 0x0f0f0f00);
+                    } else {
+                        RenderXmu(x, y, 0x1f1f1f00, 0x0f0f0f00);
+                    }
                 }
 
                 ImVec2 xmu_display_size;
@@ -475,8 +855,14 @@ void MainMenuInputView::Draw()
                     (int)((ImGui::GetColumnWidth() - xmu_display_size.x) /
                           2.0));
 
-                ImGui::Image(id, xmu_display_size, ImVec2(0.5f * i, 1),
-                             ImVec2(0.5f * (i + 1), 0));
+                if (use_gl_previews) {
+                    ImGui::Image(id, xmu_display_size, ImVec2(0.5f * i, 1),
+                                 ImVec2(0.5f * (i + 1), 0));
+                } else {
+                    ImGui::PushID(i);
+                    ImGui::InvisibleButton("xmu_preview", xmu_display_size);
+                    ImGui::PopID();
+                }
 
                 // Button to generate a new XMU
                 ImGui::PushID(i);
@@ -514,7 +900,9 @@ void MainMenuInputView::Draw()
             ImGui::NextColumn();
         }
 
-        xmu_fbo->Restore();
+        if (use_gl_previews) {
+            xmu_fbo->Restore();
+        }
 
         ImGui::PopStyleVar(); // ItemSpacing
         ImGui::Columns(1);
@@ -541,7 +929,13 @@ void MainMenuInputView::Draw()
             ImGui::PopStyleVar();
         }
 
-        if (bound_state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        bool is_gamepad = bound_state->type == INPUT_DEVICE_SDL_GAMEPAD;
+#ifdef XEMU_INPUT_UWP
+        is_gamepad = is_gamepad ||
+            bound_state->type == INPUT_DEVICE_UWP_GAMEPAD;
+#endif
+
+        if (is_gamepad && bound_state->controller_map != nullptr) {
             Toggle("Enable Rumble",
                    &bound_state->controller_map->enable_rumble);
             Toggle("Invert Left X Axis",
@@ -558,7 +952,14 @@ void MainMenuInputView::Draw()
                         .invert_axis_right_y);
         }
 
-        if (ImGui::Button("Reset to Default")) {
+        bool can_reset_mapping =
+            bound_state->type == INPUT_DEVICE_SDL_KEYBOARD ||
+            bound_state->type == INPUT_DEVICE_SDL_GAMEPAD
+#ifdef XEMU_INPUT_UWP
+            || bound_state->type == INPUT_DEVICE_UWP_GAMEPAD
+#endif
+            ;
+        if (can_reset_mapping && ImGui::Button("Reset to Default")) {
             xemu_input_reset_input_mapping(bound_state);
         }
 
@@ -572,6 +973,127 @@ void MainMenuInputView::Draw()
     Toggle("Background controller input capture",
            &g_config.input.background_input_capture,
            "Capture even if window is unfocused (requires restart)");
+
+    if (strcmp(bound_drivers[active], DRIVER_LIGHTGUN) == 0) {
+        SectionTitle("Lightgun");
+        ImGui::SliderFloat("Aim smoothing",
+                           &g_config.input.lightgun_smoothing,
+                           0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Aim sensitivity",
+                           &g_config.input.lightgun_sensitivity,
+                           0.1f, 3.0f, "%.2fx");
+    }
+
+    SectionTitle("DSU Network Input");
+    bool *dsu_enabled = nullptr;
+    bool *dsu_addon = nullptr;
+    bool *dsu_gamepad = nullptr;
+    bool *dsu_motion = nullptr;
+    int *dsu_motion_target = nullptr;
+    float *dsu_motion_sensitivity_horizontal = nullptr;
+    float *dsu_motion_sensitivity_vertical = nullptr;
+    bool *dsu_touch = nullptr;
+    bool *dsu_keyboard = nullptr;
+    bool *dsu_mouse = nullptr;
+    const char **dsu_address = nullptr;
+    int *dsu_port = nullptr;
+    int *dsu_slot = nullptr;
+#define SELECT_DSU_PLAYER(n)                                                \
+    dsu_enabled = &g_config.input.dsu.player##n.enabled;                    \
+    dsu_addon = &g_config.input.dsu.player##n.addon;                        \
+    dsu_gamepad = &g_config.input.dsu.player##n.gamepad;                    \
+    dsu_motion = &g_config.input.dsu.player##n.motion;                      \
+    dsu_motion_target = &g_config.input.dsu.player##n.motion_target;        \
+    dsu_motion_sensitivity_horizontal =                                    \
+        &g_config.input.dsu.player##n.motion_sensitivity_horizontal;        \
+    dsu_motion_sensitivity_vertical =                                      \
+        &g_config.input.dsu.player##n.motion_sensitivity_vertical;          \
+    dsu_touch = &g_config.input.dsu.player##n.touch;                        \
+    dsu_keyboard = &g_config.input.dsu.player##n.keyboard;                  \
+    dsu_mouse = &g_config.input.dsu.player##n.mouse;                        \
+    dsu_address = &g_config.input.dsu.player##n.server_address;             \
+    dsu_port = &g_config.input.dsu.player##n.server_port;                  \
+    dsu_slot = &g_config.input.dsu.player##n.slot
+    switch (active) {
+    case 0: SELECT_DSU_PLAYER(1); break;
+    case 1: SELECT_DSU_PLAYER(2); break;
+    case 2: SELECT_DSU_PLAYER(3); break;
+    default: SELECT_DSU_PLAYER(4); break;
+    }
+#undef SELECT_DSU_PLAYER
+
+    Toggle("Enable DSU for this port", dsu_enabled,
+           "Connect to a DSU server over UDP");
+    if (*dsu_enabled) {
+        static char address_buffers[4][128];
+        static const char *loaded_addresses[4] = {};
+        if (loaded_addresses[active] != *dsu_address) {
+            g_strlcpy(address_buffers[active],
+                      *dsu_address ? *dsu_address : "",
+                      sizeof(address_buffers[active]));
+            loaded_addresses[active] = *dsu_address;
+        }
+
+        ImGui::Columns(2, "dsu_network", false);
+        ImGui::SetColumnWidth(0, ImGui::GetWindowWidth() * 0.25f);
+        ImGui::Text("Server address");
+        ImGui::NextColumn();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputText("###dsu_address", address_buffers[active],
+                             sizeof(address_buffers[active]))) {
+            xemu_settings_set_string(dsu_address, address_buffers[active]);
+            loaded_addresses[active] = *dsu_address;
+        }
+        TextFieldActivateWithA();
+        ImGui::NextColumn();
+        ImGui::Text("Server port");
+        ImGui::NextColumn();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputInt("###dsu_port", dsu_port)) {
+            *dsu_port = CLAMP(*dsu_port, 1, 65535);
+        }
+        ImGui::NextColumn();
+        ImGui::Text("Remote slot");
+        ImGui::NextColumn();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputInt("###dsu_slot", dsu_slot)) {
+            *dsu_slot = CLAMP(*dsu_slot, 0, 3);
+        }
+        ImGui::Columns(1);
+
+        Toggle("Auxiliary controller", dsu_addon,
+               "Merge DSU input with the local controller on this port");
+        Toggle("Gamepad", dsu_gamepad);
+        Toggle("Motion", dsu_motion,
+               "Map DSU gyroscope motion to an Xbox input");
+        if (*dsu_motion) {
+            ChevronCombo("Motion target", dsu_motion_target,
+                         "Mouse movement\0"
+                         "Right stick\0"
+                         "Left stick\0"
+                         "D-Pad\0"
+                         "Lightgun aim\0",
+                         "Choose the input controlled by gyroscope motion");
+            ImGui::SliderFloat("Motion horizontal sensitivity",
+                               dsu_motion_sensitivity_horizontal,
+                               0.1f, 5.0f, "%.2fx");
+            ImGui::SliderFloat("Motion vertical sensitivity",
+                               dsu_motion_sensitivity_vertical,
+                               0.1f, 5.0f, "%.2fx");
+        }
+        Toggle("Touch / lightgun aim", dsu_touch);
+        Toggle("Keyboard", dsu_keyboard);
+        Toggle("Mouse", dsu_mouse);
+
+        XemuDSUPlayerState dsu_state;
+        if (xemu_dsu_get_player_state(active, &dsu_state)) {
+            ImGui::TextWrapped("Status: %s (slot %u)",
+                               dsu_state.controller.connected
+                                   ? "controller connected"
+                                   : "waiting for server",
+                               dsu_state.remote_slot);
+        }
+    }
 }
 
 void MainMenuInputView::Hide()
@@ -660,7 +1182,7 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
         ImGui::TableSetColumnIndex(1);
 
         if (m_rebinding && m_rebinding->GetTableRow() == i) {
-            ImGui::Text("Press a key to rebind");
+            ImGui::Text("Press an input to rebind");
             continue;
         }
 
@@ -672,7 +1194,8 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
                 remap_button_text =
                     SDL_GetScancodeName(static_cast<SDL_Scancode>(keycode));
             }
-        } else if (i < num_face_buttons) {
+        } else if (state->controller_map != nullptr &&
+                   i < num_face_buttons) {
                 int *button_map[num_face_buttons] = {
                     &state->controller_map->controller_mapping.a,
                     &state->controller_map->controller_mapping.b,
@@ -696,7 +1219,7 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
                     remap_button_text = SDL_GetGamepadStringForButton(
                         static_cast<SDL_GamepadButton>(button));
                 }
-        } else {
+        } else if (state->controller_map != nullptr) {
           int *axis_map[6] = {
             &state->controller_map->controller_mapping.axis_left_x,
             &state->controller_map->controller_mapping.axis_left_y,
@@ -723,10 +1246,18 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
         float min_button_width = ImGui::GetColumnWidth(1) / 2;
         float button_width = std::max(min_button_width, max_button_width);
 
-        if (ImGui::Button(remap_button_text, ImVec2(button_width, 0))) {
+        bool can_rebind = is_keyboard || state->controller_map != nullptr;
+        if (!can_rebind) {
+            ImGui::TextUnformatted(remap_button_text);
+        } else if (ImGui::Button(remap_button_text, ImVec2(button_width, 0))) {
           if (is_keyboard) {
             m_rebinding =
               std::make_unique<ControllerKeyboardRebindingMap>(i);
+#ifdef XEMU_INPUT_UWP
+          } else if (state->type == INPUT_DEVICE_UWP_GAMEPAD) {
+            m_rebinding =
+              std::make_unique<ControllerUWPGamepadRebindingMap>(i, state);
+#endif
           } else {
             m_rebinding =
               std::make_unique<ControllerGamepadRebindingMap>(i,
@@ -740,14 +1271,26 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
+#ifdef CONFIG_UWP
+    int uwp_renderer = 0;
+    ImGui::BeginDisabled();
+    ChevronCombo("Backend", &uwp_renderer,
+                 "Direct3D 12\0",
+                 "Select desired renderer implementation");
+    ImGui::EndDisabled();
+#else
     ChevronCombo("Backend", &g_config.display.renderer,
                  "Null\0"
                  "OpenGL\0"
 #ifdef CONFIG_VULKAN
                  "Vulkan\0"
 #endif
+#ifdef CONFIG_D3D12
+                 "Direct3D 12\0"
+#endif
                  ,
                  "Select desired renderer implementation");
+#endif
     int rendering_scale = nv2a_get_surface_scale_factor() - 1;
     if (ChevronCombo("Internal resolution scale", &rendering_scale,
                      "1x\0"
@@ -764,7 +1307,125 @@ void MainMenuDisplayView::Draw()
         nv2a_set_surface_scale_factor(rendering_scale+1);
     }
 
+#ifdef CONFIG_D3D12
+    Toggle("FSR 1 upscaling", &g_config.display.fsr,
+           "Rebuild edges and sharpen the game image when it is scaled up "
+           "to the screen");
+    char sharpness[48];
+    snprintf(sharpness, sizeof(sharpness),
+             "Sharpening after FSR 1 upscaling (%d%%)",
+             (int)lroundf(g_config.display.fsr_sharpness * 100));
+    ImGui::BeginDisabled(!g_config.display.fsr);
+    Slider("FSR 1 sharpness", &g_config.display.fsr_sharpness, sharpness);
+    ImGui::EndDisabled();
+
+    auto &textures = g_config.display.custom_textures;
+
+    SectionTitle("Custom textures");
+    Toggle("Load custom textures", &textures.load,
+           "Replace game textures with the files in "
+           "load\\textures\\<title ID>");
+    ImGui::BeginDisabled(!textures.load);
+    Toggle("Prefetch custom textures", &textures.prefetch,
+           "Load a game's whole texture pack in the background when it "
+           "starts, instead of each texture when it first appears");
+    ImGui::EndDisabled();
+    Toggle("Dump textures", &textures.dump,
+           "Save each new game texture to dump\\textures\\<title ID>, "
+           "named as a custom texture must be");
+#ifdef CONFIG_UWP
+    StorageLocationSelector(
+        "Custom textures folder",
+        (textures.path && *textures.path) ? textures.path :
+                                            XEMU_UWP_DEV_FILES_SYSTEM_DIR,
+        XEMU_UWP_DEV_FILES_SYSTEM_DIR, XEMU_UWP_USB_SYSTEM_DIR,
+        [](const char *path) {
+            xemu_settings_set_string(&g_config.display.custom_textures.path,
+                                     path);
+            nv2a_custom_textures_settings_changed();
+        });
+#else
+    FilePicker("Custom textures folder", textures.path, nullptr, 0, true,
+               [](const char *path) {
+                   xemu_settings_set_string(
+                       &g_config.display.custom_textures.path, path);
+                   nv2a_custom_textures_settings_changed();
+               });
+#endif
+    {
+        XemuGameLibraryState state = {};
+
+        if (xemu_game_library_get_current_state(&state) && state.running &&
+            state.title_id != 0) {
+            ImGui::TextWrapped("This game's title ID is %08X: its textures "
+                               "go in load\\textures\\%08X",
+                               state.title_id, state.title_id);
+        }
+        xemu_game_library_free_current_state(&state);
+    }
+
+    SectionTitle("Streaming");
+    Toggle("Broadcast stream", &g_config.display.stream.broadcast_enabled,
+           "Keep the broadcast active while enabled");
+    Toggle("Remote start", &g_config.display.stream.remote_start,
+           "Allow third-party apps to start/stop the broadcast over the "
+           "control port");
+    {
+        static char stream_url[512];
+        static bool stream_url_loaded = false;
+        static int stream_control_port;
+        static bool stream_control_port_loaded = false;
+        if (!stream_url_loaded) {
+            g_strlcpy(stream_url,
+                      g_config.display.stream.url ? g_config.display.stream.url
+                                                  : "",
+                      sizeof(stream_url));
+            stream_url_loaded = true;
+        }
+        if (!stream_control_port_loaded) {
+            stream_control_port = g_config.display.stream.control_port;
+            stream_control_port_loaded = true;
+        }
+
+        float size_ratio = 0.5;
+        float width = ImGui::GetColumnWidth() * size_ratio;
+        ImGui::PushFont(g_font_mgr.m_menu_font_small);
+        PrepareComboTitleDescription(
+            "Broadcast URL",
+            "Stream output URL, e.g. udp://192.168.1.22:26960", size_ratio);
+        ImGui::SetNextItemWidth(width);
+        if (ImGui::InputText("###stream_url", stream_url, sizeof(stream_url))) {
+            xemu_settings_set_string(&g_config.display.stream.url, stream_url);
+        }
+        TextFieldActivateWithA();
+        PrepareComboTitleDescription(
+            "Remote control port",
+            "UDP port for START/STOP commands when remote start is enabled",
+            size_ratio);
+        ImGui::SetNextItemWidth(width);
+        if (ImGui::InputInt("###stream_ctl_port", &stream_control_port)) {
+            if (stream_control_port < 1) {
+                stream_control_port = 1;
+            }
+            if (stream_control_port > 65535) {
+                stream_control_port = 65535;
+            }
+            g_config.display.stream.control_port = stream_control_port;
+        }
+        ImGui::PopFont();
+    }
+    ImGui::PushFont(g_font_mgr.m_menu_font_small);
+    if (!xemu_stream_is_supported()) {
+        ImGui::TextWrapped(
+            "Streaming is not available in this build (ffmpeg missing).");
+    } else {
+        ImGui::TextWrapped("Status: %s", xemu_stream_get_status());
+    }
+    ImGui::PopFont();
+#endif
+
     SectionTitle("Window");
+#ifndef CONFIG_UWP
     bool fs = xemu_is_fullscreen();
     if (Toggle("Fullscreen", &fs, "Enable fullscreen now")) {
         xemu_toggle_fullscreen();
@@ -775,6 +1436,10 @@ void MainMenuDisplayView::Draw()
     Toggle("Exclusive fullscreen",
            &g_config.display.window.fullscreen_exclusive,
            "May improve responsiveness, but slows window switching");
+#endif
+#ifdef CONFIG_UWP
+    ImGui::BeginDisabled();
+#endif
     if (ChevronCombo("Window size", &g_config.display.window.startup_size,
                      "Last Used\0"
                      "640x480\0"
@@ -789,6 +1454,9 @@ void MainMenuDisplayView::Draw()
                      "3840x2160\0",
                      "Select preferred startup window size")) {
     }
+#ifdef CONFIG_UWP
+    ImGui::EndDisabled();
+#endif
     Toggle("Vertical refresh sync", &g_config.display.window.vsync,
            "Sync to screen vertical refresh to reduce tearing artifacts");
 
@@ -797,6 +1465,8 @@ void MainMenuDisplayView::Draw()
            "Show main menu bar when mouse is activated");
     Toggle("Show notifications", &g_config.display.ui.show_notifications,
            "Display notifications in upper-right corner");
+    Toggle("Show FPS counter", &g_config.display.ui.show_fps,
+           "Display the guest frame rate in the upper-left corner");
     Toggle("Hide mouse cursor", &g_config.display.ui.hide_cursor,
            "Hide the mouse cursor when it is not moving");
 
@@ -822,6 +1492,10 @@ void MainMenuDisplayView::Draw()
     }
     Toggle("Animations", &g_config.display.ui.use_animations,
            "Enable xemu user interface animations");
+    ChevronCombo("Filter method", &g_config.display.filtering,
+                 "Linear\0"
+                 "Nearest\0",
+                 "Select framebuffer texture filtering");
     ChevronCombo("Display mode", &g_config.display.ui.fit,
                  "Center\0"
                  "Scale\0"
@@ -832,7 +1506,8 @@ void MainMenuDisplayView::Draw()
                  "Auto (Default)\0"
                  "4:3\0"
                  "16:9\0",
-                 "Select the displayed aspect ratio");
+                 "Select the displayed aspect ratio; with Auto or 16:9, games "
+                 "that support widescreen render in it from the next launch");
 }
 
 void MainMenuAudioView::Draw()
@@ -851,6 +1526,7 @@ void MainMenuAudioView::Draw()
 
 }
 
+#ifndef CONFIG_UWP
 NetworkInterface::NetworkInterface(pcap_if_t *pcap_desc, char *_friendlyname)
 {
     m_pcap_name = pcap_desc->name;
@@ -864,6 +1540,14 @@ NetworkInterface::NetworkInterface(pcap_if_t *pcap_desc, char *_friendlyname)
         m_friendly_name = m_description;
     }
 }
+#else
+NetworkInterface::NetworkInterface(const char *name, const char *description)
+{
+    m_pcap_name = name;
+    m_description = description ?: name;
+    m_friendly_name = m_description;
+}
+#endif
 
 NetworkInterfaceManager::NetworkInterfaceManager()
 {
@@ -873,6 +1557,11 @@ NetworkInterfaceManager::NetworkInterfaceManager()
 
 void NetworkInterfaceManager::Refresh(void)
 {
+#ifdef CONFIG_UWP
+    m_ifaces.clear();
+    m_current_iface = NULL;
+    m_failed_to_load_lib = true;
+#else
     pcap_if_t *alldevs, *iter;
     char err[PCAP_ERRBUF_SIZE];
 
@@ -910,6 +1599,7 @@ void NetworkInterfaceManager::Refresh(void)
     }
 
     pcap_freealldevs(alldevs);
+#endif
 }
 
 void NetworkInterfaceManager::Select(NetworkInterface &iface)
@@ -935,18 +1625,34 @@ void MainMenuNetworkView::Draw()
     bool enabled = xemu_net_is_enabled();
     g_config.net.enable = enabled;
     if (Toggle("Enable", &g_config.net.enable,
-               enabled ? "Virtual network connected (disable to change network "
-                         "settings)" :
+               enabled ? "Virtual network connected; changing a setting "
+                         "reconnects it" :
                          "Connect virtual network cable to machine")) {
         if (enabled) {
             xemu_net_disable();
         } else {
             xemu_net_enable();
         }
+        enabled = xemu_net_is_enabled();
     }
 
+    // Settings stay editable while connected; a change reconnects the
+    // virtual cable with the new configuration.
     bool appearing = ImGui::IsWindowAppearing();
-    if (enabled) ImGui::BeginDisabled();
+    bool reconnect = false;
+#ifdef CONFIG_UWP
+    if (g_config.net.backend == CONFIG_NET_BACKEND_PCAP) {
+        g_config.net.backend = CONFIG_NET_BACKEND_NAT;
+    }
+    if (ChevronCombo(
+            "Attached to", &g_config.net.backend,
+            "NAT\0"
+            "UDP Tunnel\0",
+            "Controls what the virtual network controller interfaces with")) {
+        appearing = true;
+        reconnect = true;
+    }
+#else
     if (ChevronCombo(
             "Attached to", &g_config.net.backend,
             "NAT\0"
@@ -954,32 +1660,42 @@ void MainMenuNetworkView::Draw()
             "Bridged Adapter\0",
             "Controls what the virtual network controller interfaces with")) {
         appearing = true;
+        reconnect = true;
     }
+#endif
     SectionTitle("Options");
     switch (g_config.net.backend) {
     case CONFIG_NET_BACKEND_PCAP:
-        DrawPcapOptions(appearing);
+        reconnect |= DrawPcapOptions(appearing);
         break;
     case CONFIG_NET_BACKEND_NAT:
-        DrawNatOptions(appearing);
+        reconnect |= DrawNatOptions(appearing);
         break;
     case CONFIG_NET_BACKEND_UDP:
-        DrawUdpOptions(appearing);
+        reconnect |= DrawUdpOptions(appearing);
         break;
     default: break;
     }
-    if (enabled) ImGui::EndDisabled();
+
+    if (reconnect && enabled) {
+        xemu_net_disable();
+        xemu_net_enable();
+    }
 }
 
-void MainMenuNetworkView::DrawPcapOptions(bool appearing)
+bool MainMenuNetworkView::DrawPcapOptions(bool appearing)
 {
+    bool changed = false;
+
     if (iface_mgr.get() == nullptr) {
         iface_mgr.reset(new NetworkInterfaceManager());
         iface_mgr->Refresh();
     }
 
     if (iface_mgr->m_failed_to_load_lib) {
-#if defined(_WIN32)
+#ifdef CONFIG_UWP
+        ImGui::Text("%s", "Bridged adapter networking is not available in UWP.");
+#elif defined(_WIN32)
         const char *msg = "npcap library could not be loaded.\n"
                           "To use this backend, please install npcap.";
         ImGui::Text("%s", msg);
@@ -1016,6 +1732,7 @@ void MainMenuNetworkView::DrawPcapOptions(bool appearing)
                 if (ImGui::Selectable(iface->m_friendly_name.c_str(),
                                       is_selected)) {
                     iface_mgr->Select((*iface));
+                    changed = true;
                 }
                 if (is_selected) ImGui::SetItemDefaultFocus();
                 ImGui::PopID();
@@ -1027,11 +1744,13 @@ void MainMenuNetworkView::DrawPcapOptions(bool appearing)
         ImGui::PopFont();
         DrawComboChevron();
     }
+    return changed;
 }
 
-void MainMenuNetworkView::DrawNatOptions(bool appearing)
+bool MainMenuNetworkView::DrawNatOptions(bool appearing)
 {
     static ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
+    bool changed = false;
     WidgetTitleDescriptionItem(
         "Port Forwarding",
         "Configure xemu to forward connections to guest on these ports");
@@ -1068,6 +1787,7 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
             ImGui::PushID(row);
             if (ImGui::Button("Remove")) {
                 remove_net_nat_forward_ports(row);
+                changed = true;
             }
             ImGui::PopID();
         }
@@ -1078,11 +1798,13 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
         static char buf[8] = {"1234"};
         ImGui::SetNextItemWidth(ImGui::GetColumnWidth());
         ImGui::InputText("###hostport", buf, sizeof(buf));
+        TextFieldActivateWithA();
 
         ImGui::TableSetColumnIndex(1);
         static char buf2[8] = {"1234"};
         ImGui::SetNextItemWidth(ImGui::GetColumnWidth());
         ImGui::InputText("###guestport", buf2, sizeof(buf2));
+        TextFieldActivateWithA();
 
         ImGui::TableSetColumnIndex(2);
         static CONFIG_NET_NAT_FORWARD_PORTS_PROTOCOL protocol =
@@ -1097,16 +1819,20 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
             if (sscanf(buf, "%d", &host) == 1 &&
                 sscanf(buf2, "%d", &guest) == 1) {
                 add_net_nat_forward_ports(host, guest, protocol);
+                changed = true;
             }
         }
 
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
+    return changed;
 }
 
-void MainMenuNetworkView::DrawUdpOptions(bool appearing)
+bool MainMenuNetworkView::DrawUdpOptions(bool appearing)
 {
+    bool changed = false;
+
     if (appearing) {
         strncpy(remote_addr, g_config.net.udp.remote_addr,
                 sizeof(remote_addr) - 1);
@@ -1124,6 +1850,9 @@ void MainMenuNetworkView::DrawUdpOptions(bool appearing)
     if (ImGui::InputText("###remote_host", remote_addr, sizeof(remote_addr))) {
         xemu_settings_set_string(&g_config.net.udp.remote_addr, remote_addr);
     }
+    /* Reconnect once editing finishes, not on every keystroke. */
+    changed |= ImGui::IsItemDeactivatedAfterEdit();
+    TextFieldActivateWithA();
     PrepareComboTitleDescription(
         "Bind Address", "Local addr:port to receive packets on (0.0.0.0:9968)",
         size_ratio);
@@ -1131,7 +1860,10 @@ void MainMenuNetworkView::DrawUdpOptions(bool appearing)
     if (ImGui::InputText("###local_host", local_addr, sizeof(local_addr))) {
         xemu_settings_set_string(&g_config.net.udp.bind_addr, local_addr);
     }
+    changed |= ImGui::IsItemDeactivatedAfterEdit();
+    TextFieldActivateWithA();
     ImGui::PopFont();
+    return changed;
 }
 
 MainMenuSnapshotsView::MainMenuSnapshotsView() : MainMenuTabView()
@@ -1145,6 +1877,77 @@ MainMenuSnapshotsView::MainMenuSnapshotsView() : MainMenuTabView()
 MainMenuSnapshotsView::~MainMenuSnapshotsView()
 {
     g_free(m_search_regex);
+}
+
+static bool GetSnapshotThumbnailTexture(XemuSnapshotData *data,
+                                        ImTextureID *texture_id,
+                                        int *width, int *height)
+{
+    if (texture_id == NULL || width == NULL || height == NULL) {
+        return false;
+    }
+
+    if (xemu_hud_uses_d3d12()) {
+        if (data != NULL && data->thumbnail_png_size &&
+            data->d3d12_thumbnail_resource == NULL) {
+            xemu_hud_load_d3d12_png_texture(
+                data->thumbnail_png, data->thumbnail_png_size,
+                &data->d3d12_thumbnail_resource,
+                &data->d3d12_thumbnail_texture_id,
+                &data->thumbnail_width, &data->thumbnail_height);
+        }
+
+        if (data != NULL && data->d3d12_thumbnail_texture_id != 0) {
+            *texture_id = (ImTextureID)data->d3d12_thumbnail_texture_id;
+            *width = data->thumbnail_width;
+            *height = data->thumbnail_height;
+            return *width > 0 && *height > 0;
+        }
+
+        uint64_t icon_id = 0;
+        if (xemu_hud_get_d3d12_icon_texture(&icon_id, width, height)) {
+            *texture_id = (ImTextureID)icon_id;
+            return true;
+        }
+
+        return false;
+    }
+
+#ifdef CONFIG_OPENGL
+    if (data != NULL && data->thumbnail_png_size && data->gl_thumbnail == 0) {
+        GLuint thumbnail;
+        glGenTextures(1, &thumbnail);
+        if (xemu_snapshots_load_png_to_texture(
+                thumbnail, data->thumbnail_png, data->thumbnail_png_size,
+                &data->thumbnail_width, &data->thumbnail_height)) {
+            data->gl_thumbnail = thumbnail;
+        } else {
+            glDeleteTextures(1, &thumbnail);
+        }
+    }
+
+    GLuint thumbnail = data != NULL && data->gl_thumbnail ?
+        data->gl_thumbnail : g_icon_tex;
+    if (thumbnail == 0) {
+        return false;
+    }
+
+    if (data == NULL || data->gl_thumbnail == 0 || data->thumbnail_width <= 0 ||
+        data->thumbnail_height <= 0) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, thumbnail);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, height);
+    } else {
+        *width = data->thumbnail_width;
+        *height = data->thumbnail_height;
+    }
+
+    *texture_id = (ImTextureID)(uint64_t)thumbnail;
+    return *width > 0 && *height > 0;
+#else
+    return false;
+#endif
 }
 
 bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
@@ -1189,15 +1992,11 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     const ImVec2 p1 = ImGui::GetItemRectMax();
     draw_list->PushClipRect(p0, p1, true);
 
-    // Snapshot thumbnail
-    GLuint thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
-    int thumbnail_width, thumbnail_height;
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, thumbnail);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-                             &thumbnail_width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-                             &thumbnail_height);
+    ImTextureID thumbnail = 0;
+    int thumbnail_width = 0;
+    int thumbnail_height = 0;
+    bool has_thumbnail = GetSnapshotThumbnailTexture(
+        data, &thumbnail, &thumbnail_width, &thumbnail_height);
 
     // Draw black background behind thumbnail
     ImVec2 thumbnail_min(p0.x + thumbnail_pos.x, p0.y + thumbnail_pos.y);
@@ -1206,15 +2005,17 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     draw_list->AddRectFilled(thumbnail_min, thumbnail_max, IM_COL32_BLACK);
 
     // Draw centered thumbnail image
-    int scaled_width, scaled_height;
-    ScaleDimensions(thumbnail_width, thumbnail_height, thumbnail_size.x,
-                    thumbnail_size.y, &scaled_width, &scaled_height);
-    ImVec2 img_min =
-        ImVec2(thumbnail_min.x + (thumbnail_size.x - scaled_width) / 2,
-               thumbnail_min.y + (thumbnail_size.y - scaled_height) / 2);
-    ImVec2 img_max =
-        ImVec2(img_min.x + scaled_width, img_min.y + scaled_height);
-    draw_list->AddImage((ImTextureID)(uint64_t)thumbnail, img_min, img_max);
+    if (has_thumbnail) {
+        int scaled_width, scaled_height;
+        ScaleDimensions(thumbnail_width, thumbnail_height, thumbnail_size.x,
+                        thumbnail_size.y, &scaled_width, &scaled_height);
+        ImVec2 img_min =
+            ImVec2(thumbnail_min.x + (thumbnail_size.x - scaled_width) / 2,
+                   thumbnail_min.y + (thumbnail_size.y - scaled_height) / 2);
+        ImVec2 img_max =
+            ImVec2(img_min.x + scaled_width, img_min.y + scaled_height);
+        draw_list->AddImage(thumbnail, img_min, img_max);
+    }
 
     // Snapshot title
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);
@@ -1325,6 +2126,7 @@ void MainMenuSnapshotsView::Draw()
     ImGui::InputTextWithHint("##search", "Search or name new snapshot...",
                              &m_search_buf, ImGuiInputTextFlags_CallbackEdit,
                              &OnSearchTextUpdate, this);
+    TextFieldActivateWithA();
 
     bool snapshot_with_create_name_exists = false;
     for (int i = 0; i < g_snapshot_mgr.m_snapshots_len; ++i) {
@@ -1508,6 +2310,103 @@ void MainMenuSnapshotsView::DrawSnapshotContextMenu(
     ImGui::EndPopup();
 }
 
+#ifdef CONFIG_UWP
+// Streams a file to its destination through a temporary file.
+static bool CopySystemFile(const std::string &source,
+                           const std::string &destination)
+{
+    std::string temporary = destination + ".tmp";
+    FILE *in = g_fopen(source.c_str(), "rb");
+    if (in == nullptr) {
+        return false;
+    }
+    FILE *out = g_fopen(temporary.c_str(), "wb");
+    if (out == nullptr) {
+        fclose(in);
+        return false;
+    }
+
+    std::vector<char> buffer(1 << 20);
+    bool ok = true;
+    size_t count;
+    while ((count = fread(buffer.data(), 1, buffer.size(), in)) > 0) {
+        if (fwrite(buffer.data(), 1, count, out) != count) {
+            ok = false;
+            break;
+        }
+    }
+    ok = ok && !ferror(in);
+    fclose(in);
+    ok = fclose(out) == 0 && ok;
+    if (ok && g_rename(temporary.c_str(), destination.c_str()) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        g_remove(temporary.c_str());
+    }
+    return ok;
+}
+
+// Points a system file setting at a new location, creating its folder. When
+// the new location has no file yet the current one is copied there first; the
+// hard disk image copies on a worker thread, and only from a stopped machine
+// so the image is consistent.
+static void SelectSystemFile(const char **setting, const char *path,
+                             bool large, std::function<void()> applied)
+{
+    std::string destination = path ? path : "";
+    std::string source = *setting ? *setting : "";
+    auto apply = [setting, destination, applied]() {
+        xemu_settings_set_string(setting, destination.c_str());
+        applied();
+    };
+
+    if (destination.empty()) {
+        apply();
+        return;
+    }
+    gchar *folder = g_path_get_dirname(destination.c_str());
+    g_mkdir_with_parents(folder, 0755);
+    g_free(folder);
+
+    if (source.empty() ||
+        g_ascii_strcasecmp(source.c_str(), destination.c_str()) == 0 ||
+        !g_file_test(source.c_str(), G_FILE_TEST_IS_REGULAR) ||
+        g_file_test(destination.c_str(), G_FILE_TEST_EXISTS)) {
+        apply();
+        return;
+    }
+
+    if (!large) {
+        if (CopySystemFile(source, destination)) {
+            apply();
+        } else {
+            xemu_queue_notification("Could not copy the file to the new "
+                                    "location");
+        }
+        return;
+    }
+
+    if (runstate_is_running()) {
+        xemu_queue_notification("Stop the running game before moving the "
+                                "hard disk image");
+        return;
+    }
+    xemu_queue_notification("Copying the hard disk image...");
+    std::thread([source, destination, apply]() {
+        bool ok = CopySystemFile(source, destination);
+        RunOnMainThread([ok, apply]() {
+            if (ok) {
+                apply();
+                xemu_queue_notification("Hard disk image copied");
+            } else {
+                xemu_queue_notification("Could not copy the hard disk image");
+            }
+        });
+    }).detach();
+}
+#endif
+
 MainMenuSystemView::MainMenuSystemView() : m_dirty(false)
 {
 }
@@ -1551,6 +2450,40 @@ void MainMenuSystemView::Draw()
     }
 
     SectionTitle("Files");
+#ifdef CONFIG_UWP
+    auto file_changed = [this]() {
+        m_dirty = true;
+        g_main_menu.UpdateAboutViewConfigInfo();
+    };
+    StorageFileSelector("MCPX Boot ROM", g_config.sys.files.bootrom_path,
+                        XEMU_UWP_DEV_FILES_SYSTEM_DIR, XEMU_UWP_USB_SYSTEM_DIR,
+                        "mcpx_1.0.bin", rom_file_filters, 3,
+                        [file_changed](const char *path) {
+                            SelectSystemFile(&g_config.sys.files.bootrom_path,
+                                             path, false, file_changed);
+                        });
+    StorageFileSelector("Flash ROM (BIOS)", g_config.sys.files.flashrom_path,
+                        XEMU_UWP_DEV_FILES_SYSTEM_DIR, XEMU_UWP_USB_SYSTEM_DIR,
+                        "Complex_4627v1.03.bin", rom_file_filters, 3,
+                        [file_changed](const char *path) {
+                            SelectSystemFile(&g_config.sys.files.flashrom_path,
+                                             path, false, file_changed);
+                        });
+    StorageFileSelector("Hard Disk", g_config.sys.files.hdd_path,
+                        XEMU_UWP_DEV_FILES_SYSTEM_DIR, XEMU_UWP_USB_SYSTEM_DIR,
+                        "xbox_hdd.qcow2", qcow_file_filters, 2,
+                        [file_changed](const char *path) {
+                            SelectSystemFile(&g_config.sys.files.hdd_path,
+                                             path, true, file_changed);
+                        });
+    StorageFileSelector("EEPROM", g_config.sys.files.eeprom_path,
+                        XEMU_UWP_DEV_FILES_SYSTEM_DIR, XEMU_UWP_USB_SYSTEM_DIR,
+                        "eeprom.bin", rom_file_filters, 3,
+                        [file_changed](const char *path) {
+                            SelectSystemFile(&g_config.sys.files.eeprom_path,
+                                             path, false, file_changed);
+                        });
+#else
     FilePicker("MCPX Boot ROM", g_config.sys.files.bootrom_path,
                rom_file_filters, 3, false, [this](const char *path) {
                    xemu_settings_set_string(&g_config.sys.files.bootrom_path, path);
@@ -1573,6 +2506,7 @@ void MainMenuSystemView::Draw()
                    xemu_settings_set_string(&g_config.sys.files.eeprom_path, path);
                    m_dirty = true;
                });
+#endif
 }
 
 MainMenuAboutView::MainMenuAboutView() : m_config_info_text{ NULL }
@@ -1617,17 +2551,18 @@ void MainMenuAboutView::Draw()
 
     static const char *sys_info_text = NULL;
     if (sys_info_text == NULL) {
-        const char *gl_shader_version =
-            (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-        const char *gl_version = (const char *)glGetString(GL_VERSION);
-        const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-        const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
+        const char *gpu_vendor = NULL;
+        const char *gpu_renderer = NULL;
+        const char *gpu_version = NULL;
+        const char *gpu_shader_version = NULL;
+        xemu_hud_get_renderer_info(&gpu_vendor, &gpu_renderer, &gpu_version,
+                                   &gpu_shader_version);
         sys_info_text = g_strdup_printf(
             "CPU:          %s\nOS Platform:  %s\nOS Version:   "
             "%s\nManufacturer: %s\n"
             "GPU Model:    %s\nDriver:       %s\nShader:       %s",
             xemu_get_cpu_info(), SDL_GetPlatform(), xemu_get_os_info(),
-            gl_vendor, gl_renderer, gl_version, gl_shader_version);
+            gpu_vendor, gpu_renderer, gpu_version, gpu_shader_version);
     }
 
     if (m_config_info_text == NULL) {
@@ -1662,13 +2597,48 @@ void MainMenuAboutView::Draw()
 
     SectionTitle("Community");
 
-    ImGui::Text("Visit");
+    ImGui::TextUnformatted("Join the community on");
     ImGui::SameLine();
-    if (ImGui::SmallButton("https://xemu.app")) {
-        SDL_OpenURL("https://xemu.app");
+    ImGui::SetNextItemWidth(220.0f * g_viewport_mgr.m_scale);
+    if (ImGui::BeginCombo("##community_discords", "Discord")) {
+        if (ImGui::Selectable("Xbox Emulation Hub")) {
+            SDL_OpenURL("https://discord.gg/WCmxvvxHqu");
+        }
+        if (ImGui::Selectable("Revives Community Server")) {
+            SDL_OpenURL("https://discord.com/invite/f82Tr22vRZ");
+        }
+        ImGui::EndCombo();
     }
     ImGui::SameLine();
-    ImGui::Text("for more information");
+    ImGui::Text("for support and discussion");
+
+    ImGui::TextUnformatted("Visit the");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Emulation Revival app store")) {
+        SDL_OpenURL("https://emulationrevival.github.io/");
+    }
+    ImGui::SameLine();
+    ImGui::Text("for more Xbox apps and emulators");
+}
+
+// SetKeyboardFocusHere() also activates its target, which would open a
+// combo or flip a toggle; this only moves the navigation focus there.
+static void FocusNextItem()
+{
+    ImGuiContext &g = *GImGui;
+    ImGuiWindow *window = g.CurrentWindow;
+
+    ImGui::SetNavWindow(window);
+    ImGui::NavMoveRequestSubmit(
+        ImGuiDir_None, ImGuiDir_Down,
+        ImGuiNavMoveFlags_IsTabbing | ImGuiNavMoveFlags_FocusApi |
+            ImGuiNavMoveFlags_NoSelect,
+        window->Appearing ? ImGuiScrollFlags_KeepVisibleEdgeX |
+                                ImGuiScrollFlags_AlwaysCenterY :
+                            ImGuiScrollFlags_KeepVisibleEdgeX |
+                                ImGuiScrollFlags_KeepVisibleEdgeY);
+    g.NavTabbingDir = 1;
+    g.NavTabbingCounter = 1;
 }
 
 MainMenuTabButton::MainMenuTabButton(std::string text, std::string icon)
@@ -1718,6 +2688,9 @@ MainMenuScene::MainMenuScene()
 {
     m_had_focus_last_frame = false;
     m_focus_view = false;
+    m_content_active = false;
+    m_focus_tab = false;
+    m_had_active_item_last_frame = false;
     m_tabs.push_back(&m_general_button);
     m_tabs.push_back(&m_input_button);
     m_tabs.push_back(&m_display_button);
@@ -1763,6 +2736,8 @@ void MainMenuScene::ShowAbout()
 void MainMenuScene::SetNextViewIndexWithFocus(int i)
 {
     m_focus_view = true;
+    m_content_active = true;
+    m_focus_tab = false;
     SetNextViewIndex(i);
 
     if (!g_scene_mgr.IsDisplayingScene()) {
@@ -1772,6 +2747,12 @@ void MainMenuScene::SetNextViewIndexWithFocus(int i)
 
 void MainMenuScene::Show()
 {
+    // Opened without a specific page: start on the category list.
+    if (!m_focus_view) {
+        m_content_active = false;
+        m_focus_tab = true;
+    }
+    m_had_focus_last_frame = false;
     m_background.Show();
     m_nav_control_view.Show();
     m_animation.EaseIn();
@@ -1779,6 +2760,9 @@ void MainMenuScene::Show()
 
 void MainMenuScene::Hide()
 {
+#ifdef CONFIG_UWP
+    xemu_settings_save();
+#endif
     m_views[m_current_view_index]->Hide();
     m_background.Hide();
     m_nav_control_view.Hide();
@@ -1803,28 +2787,46 @@ void MainMenuScene::HandleInput()
     bool focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows |
                                         ImGuiFocusedFlags_NoPopupHierarchy);
 
-    // XXX: Ensure we have focus for two frames. If a user cancels a popup
-    // window, we do not want to cancel main
-    //      window as well.
-    if (nofocus || (focus && m_had_focus_last_frame &&
-                    (ImGui::IsKeyDown(ImGuiKey_GamepadFaceRight) ||
-                     ImGui::IsKeyDown(ImGuiKey_Escape)))) {
+    if (nofocus) {
         Hide();
         return;
     }
 
-    if (focus && m_had_focus_last_frame) {
-        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) {
-            SetNextViewIndex((m_current_view_index + m_tabs.size() - 1) %
-                             m_tabs.size());
+    // Require focus for two frames: B that just closed a popup or ended a
+    // text edit is not also a back press.
+    bool item_active = ImGui::IsAnyItemActive();
+    bool back = focus && m_had_focus_last_frame && !item_active &&
+                !m_had_active_item_last_frame && !IsInputRebinding() &&
+                (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+                 ImGui::IsKeyPressed(ImGuiKey_Escape, false));
+    if (back) {
+        if (m_content_active) {
+            // Back from a page returns to its category.
+            m_content_active = false;
+            m_focus_tab = true;
+        } else {
+            Hide();
+            return;
         }
+    }
 
-        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1)) {
-            SetNextViewIndex((m_current_view_index + 1) % m_tabs.size());
+    if (focus && m_had_focus_last_frame) {
+        int step = 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) {
+            step = m_tabs.size() - 1;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1)) {
+            step = 1;
+        }
+        if (step != 0) {
+            SetNextViewIndex((m_current_view_index + step) % m_tabs.size());
+            if (m_content_active) {
+                m_focus_view = true;
+            }
         }
     }
 
     m_had_focus_last_frame = focus;
+    m_had_active_item_last_frame = item_active;
 }
 
 void MainMenuScene::UpdateAboutViewConfigInfo()
@@ -1883,21 +2885,36 @@ bool MainMenuScene::Draw()
         ImGui::BeginChild("###MainWindowNav", ImVec2(nav_width, -1), true,
                           ImGuiWindowFlags_NavFlattened);
 
-        bool move_focus_to_tab = false;
+        bool move_focus_to_tab = m_focus_tab && !m_content_active;
+        m_focus_tab = false;
         if (m_current_view_index != m_next_view_index) {
             m_current_view_index = m_next_view_index;
-            if (!m_focus_view) {
+            if (!m_focus_view && !m_content_active) {
                 move_focus_to_tab = true;
             }
         }
 
+        // Only the active pane takes directional navigation, so the
+        // controller cannot drift between the category list and a page.
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, m_content_active);
         int i = 0;
         for (auto &button : m_tabs) {
+            bool pressed = button->Draw(i == m_current_view_index);
             if (move_focus_to_tab && i == m_current_view_index) {
-                ImGui::SetKeyboardFocusHere();
+                ImGui::FocusItem();
                 move_focus_to_tab = false;
             }
-            if (button->Draw(i == m_current_view_index)) {
+            if (pressed) {
+                // A opens the page.
+                if (i != m_current_view_index) {
+                    SetNextViewIndex(i);
+                }
+                m_content_active = true;
+                m_focus_view = true;
+            } else if (!m_content_active && i != m_current_view_index &&
+                       g_input_mgr.IsNavigatingWithController() &&
+                       ImGui::IsItemFocused()) {
+                // The highlighted category's page shows alongside.
                 SetNextViewIndex(i);
             }
             if (i == m_current_view_index) {
@@ -1905,6 +2922,7 @@ bool MainMenuScene::Draw()
             }
             i++;
         }
+        ImGui::PopItemFlag();
         ImGui::EndChild();
         ImGui::PopStyleColor();
 
@@ -1943,11 +2961,13 @@ bool MainMenuScene::Draw()
         }
 
         ImGui::PushFont(g_font_mgr.m_default_font);
-        if (m_focus_view) {
-            ImGui::SetKeyboardFocusHere();
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, !m_content_active);
+        if (m_focus_view && m_current_view_index == m_next_view_index) {
+            FocusNextItem();
             m_focus_view = false;
         }
         m_views[m_current_view_index]->Draw();
+        ImGui::PopItemFlag();
 
         ImGui::PopFont();
         ImGui::EndChild();

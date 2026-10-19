@@ -321,9 +321,15 @@ extern char **gArgv;
 
 void Updater::restart_to_updated()
 {
+#ifdef CONFIG_UWP
+    DPRINTF("UWP restart to updated executable is not implemented; "
+            "package updates must use the UWP deployment flow\n");
+    m_status = UPDATER_ERROR;
+#else
     char *target_exec = g_strdup_printf("%s%s", SDL_GetBasePath(), "xemu.exe");
     DPRINTF("Restarting to updated executable %s\n", target_exec);
     _execv(target_exec, gArgv);
     DPRINTF("Launching updated executable failed\n");
     exit(1);
+#endif
 }

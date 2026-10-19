@@ -17,10 +17,13 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #include "ui/xemu-notifications.h"
+#include "ui/xemu-dsu.h"
+#include "ui/xemu-game-library.h"
+#include "ui/xemu-stream.h"
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
-#include <filesystem>
-#include <map>
 #include "misc.hh"
 #include "actions.hh"
 #include "font-manager.hh"
@@ -32,6 +35,7 @@
 #include "IconsFontAwesome6.h"
 #include "../xemu-snapshots.h"
 #include "main-menu.hh"
+#include "game-library.hh"
 
 PopupMenuItemDelegate::~PopupMenuItemDelegate() {}
 void PopupMenuItemDelegate::PushMenu(PopupMenu &menu) {}
@@ -88,6 +92,7 @@ static bool PopupMenuSubmenuButton(std::string text, std::string icon = "")
     return status;
 }
 
+#ifndef CONFIG_UWP
 static bool PopupMenuToggle(std::string text, std::string icon = "", bool *v = nullptr)
 {
     bool l_v = false;
@@ -111,6 +116,7 @@ static bool PopupMenuToggle(std::string text, std::string icon = "", bool *v = n
 
     return status;
 }
+#endif
 
 static bool PopupMenuSlider(std::string text, std::string icon = "", float *v = NULL)
 {
@@ -312,10 +318,12 @@ public:
             ImGui::SetKeyboardFocusHere();
         }
         PopupMenuSlider("Volume", ICON_FA_VOLUME_HIGH, &g_config.audio.volume_limit);
+#ifndef CONFIG_UWP
         bool fs = xemu_is_fullscreen();
         if (PopupMenuToggle("Fullscreen", ICON_FA_WINDOW_MAXIMIZE, &fs)) {
             xemu_toggle_fullscreen();
         }
+#endif
         if (PopupMenuSubmenuButton("Display Mode", ICON_FA_EXPAND)) {
             nav.PushFocus();
             nav.PushMenu(display_mode);
@@ -342,13 +350,117 @@ public:
 
 class GamesPopupMenu : public virtual PopupMenu {
 protected:
-    std::multimap<std::string, std::string> sorted_file_names;
+    struct GameItem {
+        std::string token;
+        std::string label;
+        std::string cover_path;
+        void *d3d12_resource = nullptr;
+        uint64_t texture_id = 0;
+        int texture_width = 0;
+        int texture_height = 0;
+        bool cover_attempted = false;
+
+        ~GameItem()
+        {
+            xemu_hud_release_d3d12_texture(d3d12_resource);
+        }
+    };
+
+    std::vector<std::unique_ptr<GameItem>> games;
+    uint64_t library_generation = 0;
+
+    static bool GameButton(const GameItem &game)
+    {
+        ImGui::PushFont(g_font_mgr.m_menu_font);
+        auto button_text = string_format("%s %s", ICON_FA_COMPACT_DISC,
+                                         game.label.c_str());
+        float height = game.texture_id != 0
+            ? std::max(ImGui::GetFrameHeight(), 58.0f * g_viewport_mgr.m_scale)
+            : 0.0f;
+        bool status = ImGui::Button(button_text.c_str(),
+                                    ImVec2(-FLT_MIN, height));
+        ImGui::PopFont();
+
+        if (game.texture_id != 0 && game.texture_width > 0 &&
+            game.texture_height > 0) {
+            ImVec2 min = ImGui::GetItemRectMin();
+            ImVec2 max = ImGui::GetItemRectMax();
+            float image_height = max.y - min.y - 4.0f;
+            float image_width = image_height * game.texture_width /
+                                game.texture_height;
+            image_width = std::min(image_width,
+                                   48.0f * g_viewport_mgr.m_scale);
+            ImVec2 image_max(max.x - 2.0f, max.y - 2.0f);
+            ImVec2 image_min(image_max.x - image_width,
+                             image_max.y - image_height);
+            ImGui::GetWindowDrawList()->AddImage(
+                (ImTextureID)game.texture_id, image_min, image_max);
+        }
+        return status;
+    }
+
+    static void TryLoadCover(GameItem &game)
+    {
+        if (game.cover_attempted || game.cover_path.empty() ||
+            !xemu_hud_uses_d3d12()) {
+            return;
+        }
+        game.cover_attempted = true;
+
+        char *data = nullptr;
+        gsize size = 0;
+        GError *error = nullptr;
+        if (!g_file_get_contents(game.cover_path.c_str(), &data, &size,
+                                 &error)) {
+            g_clear_error(&error);
+            return;
+        }
+        if (size <= 8 * 1024 * 1024) {
+            xemu_hud_load_d3d12_image_texture(
+                data, size, &game.d3d12_resource, &game.texture_id,
+                &game.texture_width, &game.texture_height);
+        }
+        g_free(data);
+    }
+
+    void SyncGameList()
+    {
+        size_t count = 0;
+        XemuGameLibraryEntry *snapshot =
+            xemu_game_library_snapshot(&count);
+        std::unordered_map<std::string, std::unique_ptr<GameItem>> previous;
+        for (auto &game : games) {
+            std::string token = game->token;
+            previous.emplace(std::move(token), std::move(game));
+        }
+        games.clear();
+        games.reserve(count);
+
+        for (size_t i = 0; i < count; i++) {
+            std::unique_ptr<GameItem> game;
+            auto existing = previous.find(snapshot[i].token);
+            if (existing != previous.end() &&
+                existing->second->cover_path == snapshot[i].cover_path) {
+                game = std::move(existing->second);
+                previous.erase(existing);
+            } else {
+                game = std::make_unique<GameItem>();
+                game->token = snapshot[i].token;
+                game->cover_path = snapshot[i].cover_path;
+            }
+            game->label = snapshot[i].label;
+            games.emplace_back(std::move(game));
+        }
+        xemu_game_library_free_snapshot(snapshot, count);
+        library_generation = xemu_game_library_generation();
+    }
 
 public:
     void Show(const ImVec2 &direction) override
     {
         PopupMenu::Show(direction);
-        PopulateGameList();
+        xemu_game_library_refresh();
+        SyncGameList();
     }
 
     bool DrawItems(PopupMenuItemDelegate &nav) override
@@ -359,15 +471,37 @@ public:
             ImGui::SetKeyboardFocusHere();
         }
 
-        for (const auto &[label, file_path] : sorted_file_names) {
-            if (PopupMenuButton(label, ICON_FA_COMPACT_DISC)) {
-                ActionLoadDiscFile(file_path.c_str());
-                nav.ClearMenuStack();
-                pop = true;
-            }
+        if (library_generation != xemu_game_library_generation()) {
+            SyncGameList();
         }
 
-        if (sorted_file_names.size() == 0) {
+        bool loaded_cover_this_frame = false;
+        for (auto &game : games) {
+            ImGui::PushID(game->token.c_str());
+            if (GameButton(*game)) {
+                char *path =
+                    xemu_game_library_resolve_token(game->token.c_str());
+                if (path != nullptr) {
+                    ActionLoadDiscFile(path);
+                    g_free(path);
+                    nav.ClearMenuStack();
+                    pop = true;
+                } else {
+                    xemu_queue_error_message(
+                        "The selected game is no longer available. "
+                        "Refresh the Games directory and try again.");
+                    xemu_game_library_refresh();
+                }
+            }
+            if (!loaded_cover_this_frame && ImGui::IsItemVisible() &&
+                !game->cover_attempted && !game->cover_path.empty()) {
+                TryLoadCover(*game);
+                loaded_cover_this_frame = true;
+            }
+            ImGui::PopID();
+        }
+
+        if (games.empty()) {
             if (PopupMenuButton("No games found", ICON_FA_SLIDERS)) {
                 nav.ClearMenuStack();
                 g_scene_mgr.PushScene(g_main_menu);
@@ -378,24 +512,6 @@ public:
             nav.PopFocus();
         }
         return pop;
-    }
-
-    void PopulateGameList() {
-        sorted_file_names.clear();
-        std::filesystem::path directory(g_config.general.games_dir);
-        std::error_code ec;
-        if (std::filesystem::is_directory(directory, ec)) {
-            for (const auto &file :
-                 std::filesystem::directory_iterator(directory)) {
-                const auto &file_path = file.path();
-                if (std::filesystem::is_regular_file(file_path) &&
-                    (file_path.extension() == ".iso" ||
-                     file_path.extension() == ".xiso")) {
-                    sorted_file_names.insert(
-                        { file_path.stem().string(), file_path.string() });
-                }
-            }
-        }
     }
 };
 
@@ -419,6 +535,11 @@ public:
             refocus_first_item = false;
         }
 
+        if (PopupMenuButton("Game Library", ICON_FA_TV)) {
+            g_scene_mgr.PushScene(g_game_library);
+            pop = true;
+        }
+
         bool running = runstate_is_running();
         if (running) {
             if (PopupMenuButton("Pause", ICON_FA_CIRCLE_PAUSE)) {
@@ -435,6 +556,23 @@ public:
             ActionScreenshot();
             pop = true;
         }
+        if (xemu_stream_is_active()) {
+            if (PopupMenuButton("Stop Stream", ICON_FA_NETWORK_WIRED)) {
+                xemu_dsu_request_stream(false);
+                xemu_stream_request_stop();
+                if (g_config.display.stream.broadcast_enabled) {
+                    g_config.display.stream.broadcast_enabled = false;
+                }
+                pop = true;
+            }
+        } else if (PopupMenuButton("Start Stream", ICON_FA_NETWORK_WIRED)) {
+            // Streams go to a connected frontend, which supplies the target.
+            if (!xemu_dsu_request_stream(true)) {
+                xemu_queue_notification("No network frontend is connected to "
+                                        "stream to");
+            }
+            pop = true;
+        }
         if (PopupMenuButton("Save Snapshot", ICON_FA_DOWNLOAD)) {
             xemu_snapshots_save(NULL, NULL);
             xemu_queue_notification("Created new snapshot");
@@ -445,7 +583,7 @@ public:
             nav.PushMenu(games);
         }
         if (PopupMenuButton("Eject Disc", ICON_FA_EJECT)) {
-            ActionEjectDisc();
+            ActionEjectDiscToLibrary();
             pop = true;
         }
         if (PopupMenuButton("Load Disc...", ICON_FA_COMPACT_DISC)) {
@@ -566,6 +704,9 @@ void PopupMenuScene::Show()
 
 void PopupMenuScene::Hide()
 {
+#ifdef CONFIG_UWP
+    xemu_settings_save();
+#endif
     m_background.Hide();
     m_nav_control_view.Hide();
     // m_big_state_icon.Hide();

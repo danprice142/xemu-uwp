@@ -23,6 +23,9 @@
 #include "../xemu-snapshots.h"
 #include "../xemu-notifications.h"
 #include "snapshot-manager.hh"
+#include "scene-manager.hh"
+#include "game-library.hh"
+#include "../xemu-game-library.h"
 #include <filesystem>
 
 void ActionEjectDisc(void)
@@ -32,6 +35,14 @@ void ActionEjectDisc(void)
     if (err) {
         xemu_queue_error_message(error_get_pretty(err));
         error_free(err);
+    }
+}
+
+void ActionEjectDiscToLibrary(void)
+{
+    ActionEjectDisc();
+    if (g_config.general.library_on_launch) {
+        g_scene_mgr.PushScene(g_game_library);
     }
 }
 
@@ -52,19 +63,46 @@ void ActionLoadDisc(void)
 
 void ActionLoadDiscFile(const char *file_path)
 {
+    if (!ActionLoadDiscFileChecked(file_path)) {
+        return;
+    }
+
+    /* Merely replacing the ATAPI medium leaves the running Xbox dashboard or
+     * firmware on its current screen. A frontend launch is expected to boot
+     * the selected title, so reset the guest after a successful mount and
+     * resume it if the menu owned a paused VM. Boot pipelines belong to the
+     * new disc's list, title 0's until the title is known. */
+    nv2a_shader_cache_set_title(
+        xemu_game_library_title_id_for_path(file_path));
+    ActionReset();
+    if (!runstate_is_running()) {
+        vm_start();
+    }
+}
+
+bool ActionLoadDiscFileChecked(const char *file_path)
+{
     Error *err = NULL;
     xemu_load_disc(file_path, &err);
 
     if (err) {
         xemu_queue_error_message(error_get_pretty(err));
         error_free(err);
+        return false;
     } else {
         const char *games_dir = g_config.general.games_dir;
         if (!games_dir || !games_dir[0]) {
             std::string dir = std::filesystem::path(file_path).parent_path().string();
             xemu_settings_set_string(&g_config.general.games_dir, dir.c_str());
         }
+#ifdef CONFIG_UWP
+        /* The UWP picker completes asynchronously after the popup has already
+         * hidden (and saved its previous settings). Persist the selected disc
+         * here so it is still mounted on the next app launch. */
+        xemu_settings_save();
+#endif
     }
+    return true;
 }
 
 void ActionTogglePause(void)

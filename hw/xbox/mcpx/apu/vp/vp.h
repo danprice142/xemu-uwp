@@ -87,6 +87,12 @@ typedef struct {
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];
+    /*
+     * Held by the frame thread from its voice lock check until the queued
+     * voices are processed; a CPU voice lock waits on it instead of on the
+     * device lock, which the frame thread holds for the whole frame.
+     */
+    QemuMutex dispatch_lock;
 
     struct {
         int current_entry;

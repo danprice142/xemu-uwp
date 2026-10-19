@@ -8,6 +8,58 @@ general:
       default: true
   screenshot_dir: string
   games_dir: string
+  library_on_launch:
+    type: bool
+    default: true
+  screenscraper:
+    username: string
+    media_dir: string
+    box_art_style:
+      type: enum
+      values: [box_2d, box_3d, mix_v1, mix_v2, fan_art, screenshot, logo, box_back, disc]
+      default: box_2d
+    large_box_art_style:
+      type: enum
+      values: [box_2d, box_3d, mix_v1, mix_v2, fan_art, screenshot, logo, box_back, disc]
+      default: box_2d
+    background:
+      type: enum
+      values: ['off', fan_art, screenshot, video, mix_v1, mix_v2]
+      default: fan_art
+    media:
+      box_front:
+        type: bool
+        default: true
+      box_3d:
+        type: bool
+        default: true
+      box_back:
+        type: bool
+        default: true
+      wheels:
+        type: bool
+        default: true
+      physical_media:
+        type: bool
+        default: true
+      mix_v1:
+        type: bool
+        default: true
+      mix_v2:
+        type: bool
+        default: true
+      fan_art:
+        type: bool
+        default: true
+      screenshots:
+        type: bool
+        default: true
+      videos:
+        type: bool
+        default: true
+    overwrite_assets:
+      type: bool
+      default: false
   skip_boot_anim: bool
   # throttle_io: bool
   last_viewed_menu_index: integer
@@ -60,6 +112,181 @@ input:
     type: bool
     default: true
   background_input_capture: bool
+  # Lightgun aim smoothing and sensitivity. On UWP the pointer source is DSU
+  # touch input; desktop pointer backends may use the same values.
+  lightgun_smoothing:
+    type: number
+    default: 0.2
+  lightgun_sensitivity:
+    type: number
+    default: 1.0
+  dsu:
+    # DSU protocol UDP endpoints. Each player may use a separate
+    # DSU server; the slot selects the controller on that server.
+    player1:
+      enabled:
+        type: bool
+        default: false
+      server_address:
+        type: string
+        default: 127.0.0.1
+      server_port:
+        type: integer
+        default: 26760
+      slot:
+        type: integer
+        default: 0
+      addon:
+        type: bool
+        default: false
+      gamepad:
+        type: bool
+        default: true
+      motion:
+        type: bool
+        default: false
+      motion_target:
+        type: enum
+        values: [mouse, right_stick, left_stick, dpad, lightgun]
+        default: right_stick
+      motion_sensitivity_horizontal:
+        type: number
+        default: 1.0
+      motion_sensitivity_vertical:
+        type: number
+        default: 1.0
+      touch:
+        type: bool
+        default: true
+      keyboard:
+        type: bool
+        default: true
+      mouse:
+        type: bool
+        default: true
+    player2:
+      enabled:
+        type: bool
+        default: false
+      server_address:
+        type: string
+        default: 127.0.0.1
+      server_port:
+        type: integer
+        default: 26760
+      slot:
+        type: integer
+        default: 1
+      addon:
+        type: bool
+        default: false
+      gamepad:
+        type: bool
+        default: true
+      motion:
+        type: bool
+        default: false
+      motion_target:
+        type: enum
+        values: [mouse, right_stick, left_stick, dpad, lightgun]
+        default: right_stick
+      motion_sensitivity_horizontal:
+        type: number
+        default: 1.0
+      motion_sensitivity_vertical:
+        type: number
+        default: 1.0
+      touch:
+        type: bool
+        default: true
+      keyboard:
+        type: bool
+        default: true
+      mouse:
+        type: bool
+        default: true
+    player3:
+      enabled:
+        type: bool
+        default: false
+      server_address:
+        type: string
+        default: 127.0.0.1
+      server_port:
+        type: integer
+        default: 26760
+      slot:
+        type: integer
+        default: 2
+      addon:
+        type: bool
+        default: false
+      gamepad:
+        type: bool
+        default: true
+      motion:
+        type: bool
+        default: false
+      motion_target:
+        type: enum
+        values: [mouse, right_stick, left_stick, dpad, lightgun]
+        default: right_stick
+      motion_sensitivity_horizontal:
+        type: number
+        default: 1.0
+      motion_sensitivity_vertical:
+        type: number
+        default: 1.0
+      touch:
+        type: bool
+        default: true
+      keyboard:
+        type: bool
+        default: true
+      mouse:
+        type: bool
+        default: true
+    player4:
+      enabled:
+        type: bool
+        default: false
+      server_address:
+        type: string
+        default: 127.0.0.1
+      server_port:
+        type: integer
+        default: 26760
+      slot:
+        type: integer
+        default: 3
+      addon:
+        type: bool
+        default: false
+      gamepad:
+        type: bool
+        default: true
+      motion:
+        type: bool
+        default: false
+      motion_target:
+        type: enum
+        values: [mouse, right_stick, left_stick, dpad, lightgun]
+        default: right_stick
+      motion_sensitivity_horizontal:
+        type: number
+        default: 1.0
+      motion_sensitivity_vertical:
+        type: number
+        default: 1.0
+      touch:
+        type: bool
+        default: true
+      keyboard:
+        type: bool
+        default: true
+      mouse:
+        type: bool
+        default: true
   keyboard_controller_scancode_map:
     # Scancode reference : https://github.com/libsdl-org/SDL/blob/main/include/SDL_scancode.h
     a:
@@ -226,8 +453,34 @@ input:
 display:
   renderer:
     type: enum
-    values: ["NULL", OPENGL, VULKAN]
+    values: ["NULL", OPENGL, VULKAN, D3D12]
     default: OPENGL
+  stream:
+    # When enabled the broadcast is started automatically and kept active.
+    broadcast_enabled:
+      type: bool
+      default: false
+    # When enabled, third-party apps may start/stop the broadcast over the
+    # control channel (UDP text commands "START"/"STOP" on control_port).
+    remote_start:
+      type: bool
+      default: false
+    # H.264 broadcast output URL. Editable in-app.
+    url:
+      type: string
+      default: udp://192.168.1.22:26960
+    # UDP port the remote-start control channel listens on.
+    control_port:
+      type: integer
+      default: 26961
+    # Target streaming framerate.
+    fps:
+      type: integer
+      default: 30
+    # Target streaming bitrate in kbps.
+    bitrate_kbps:
+      type: integer
+      default: 6000
   vulkan:
     validation_layers: bool
     debug_shaders: bool
@@ -237,10 +490,31 @@ display:
     surface_scale:
       type: integer
       default: 1
+  custom_textures:
+    # Replace game textures with files from <path>/load/textures/<title ID>.
+    load:
+      type: bool
+      default: false
+    # Load a game's whole texture pack in the background when it starts.
+    prefetch:
+      type: bool
+      default: false
+    # Save each new game texture to <path>/dump/textures/<title ID>.
+    dump:
+      type: bool
+      default: false
+    # Folder holding load/ and dump/; empty selects the default location.
+    path: string
   filtering:
     type: enum
     values: [linear, nearest]
     default: linear
+  # Upscale the game image to the screen with FSR 1 instead of the filter.
+  fsr: bool
+  # FSR 1 sharpening strength, from none (0) to the strongest (1).
+  fsr_sharpness:
+    type: number
+    default: 0.8
   window:
     fullscreen_on_startup: bool
     fullscreen_exclusive: bool
@@ -264,6 +538,9 @@ display:
     show_notifications:
       type: bool
       default: true
+    show_fps:
+      type: bool
+      default: false
     hide_cursor:
       type: bool
       default: true
@@ -371,5 +648,11 @@ perf:
     type: bool
     default: true
   cache_shaders:
+    type: bool
+    default: true
+  precompile_shaders:
+    type: bool
+    default: true
+  precompile_shaders_wait:
     type: bool
     default: true

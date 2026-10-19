@@ -4,7 +4,7 @@ xemu_ss.add(files(
   'compat.cc',
   'debug.cc',
   'font-manager.cc',
-  'gl-helpers.cc',
+  'game-library.cc',
   'input-manager.cc',
   'main-menu.cc',
   'main.cc',
@@ -22,6 +22,12 @@ xemu_ss.add(files(
   'welcome.cc',
   'widgets.cc',
 ))
+
+if opengl.found()
+  xemu_ss.add(files('gl-helpers.cc'))
+else
+  xemu_ss.add(files('gl-helpers-stub.cc'))
+endif
 
 if host_os == 'windows'
   xemu_ss.add(files('update.cc'))

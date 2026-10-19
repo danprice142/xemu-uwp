@@ -18,6 +18,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/cpus.h"
+#if defined(XBOX) && defined(_WIN32)
+#include "accel/tcg/xbox-fastmem.h"
+#endif
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -200,6 +204,9 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
 
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc)
 {
+#ifdef XBOX
+    qatomic_set(&qemu_tb_restores, qemu_tb_restores + 1);
+#endif
     /*
      * The host_pc has to be in the rx region of the code buffer.
      * If it is not we will not be able to resolve it here.
@@ -265,6 +272,9 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 {
+#ifdef XBOX
+    qatomic_set(&qemu_tb_gens, qemu_tb_gens + 1);
+#endif
     CPUArchState *env = cpu_env(cpu);
     TranslationBlock *tb, *existing_tb;
     tb_page_addr_t phys_pc, phys_p2;
@@ -346,6 +356,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
  restart_translate:
     trace_translate_block(tb, s.pc, tb->tc.ptr);
+#if defined(XBOX) && defined(_WIN32)
+    xbox_fastmem_stage_reset();
+#endif
 
     gen_code_size = setjmp_gen_code(env, tb, s.pc, host_pc, &max_insns, &ti);
     if (unlikely(gen_code_size < 0)) {
@@ -421,6 +434,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         goto buffer_overflow;
     }
     tb->tc.size = gen_code_size;
+#if defined(XBOX) && defined(_WIN32)
+    /* The code is final: its direct-access sites may now fault. */
+    xbox_fastmem_stage_commit();
+#endif
 
     /*
      * For CF_PCREL, attribute all executions of the generated code
@@ -619,6 +636,9 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
  */
 void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 {
+#ifdef XBOX
+    qatomic_set(&qemu_tb_io_recompiles, qemu_tb_io_recompiles + 1);
+#endif
     TranslationBlock *tb;
     CPUClass *cc;
     uint32_t n;
@@ -672,6 +692,10 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 void tcg_flush_jmp_cache(CPUState *cpu)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+#ifdef XBOX
+    qatomic_set(&qemu_tb_jmp_flushes, qemu_tb_jmp_flushes + 1);
+#endif
 
     /* During early initialization, the cache may not yet be allocated. */
     if (unlikely(jc == NULL)) {

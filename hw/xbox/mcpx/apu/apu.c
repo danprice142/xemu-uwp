@@ -23,6 +23,16 @@
 
 MCPXAPUState *g_state; // Used via debug handlers
 
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+#define MCPX_APU_UWP_TRACE(step) \
+    fprintf(stderr, "xemu UWP: mcpx_apu_realize " step "\n")
+#define MCPX_APU_UWP_INIT_TRACE(step) \
+    fprintf(stderr, "xemu UWP: mcpx_apu_init " step "\n")
+#else
+#define MCPX_APU_UWP_TRACE(step) do { } while (0)
+#define MCPX_APU_UWP_INIT_TRACE(step) do { } while (0)
+#endif
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -257,6 +267,9 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_AUDIO_TRACE)
+    fprintf(stderr, "xemu UWP: mcpx_apu_frame_thread started\n");
+#endif
     qemu_mutex_lock(&d->lock);
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested) {
@@ -387,8 +400,10 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(dev);
 
+    MCPX_APU_UWP_TRACE("setting PCI interrupt pin");
     dev->config[PCI_INTERRUPT_PIN] = 0x01;
 
+    MCPX_APU_UWP_TRACE("creating MMIO regions");
     memory_region_init_io(&d->mmio, OBJECT(dev), &mcpx_apu_mmio_ops, d,
                           "mcpx-apu-mmio", 0x80000);
 
@@ -405,7 +420,9 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
     memory_region_add_subregion(&d->mmio, 0x50000, &d->ep.mmio);
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
+    MCPX_APU_UWP_TRACE("finished MMIO regions and BAR registration");
 
+    MCPX_APU_UWP_TRACE("initializing mutexes and conditions");
     d->set_irq = false;
     d->exiting = false;
     d->is_idle = false;
@@ -414,21 +431,33 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
+    MCPX_APU_UWP_TRACE("finished mutexes and conditions");
 
+    MCPX_APU_UWP_TRACE("entering voice processor init");
     mcpx_apu_vp_init(d);
+    MCPX_APU_UWP_TRACE("finished voice processor init");
+    MCPX_APU_UWP_TRACE("entering DSP init");
     mcpx_apu_dsp_init(d);
+    MCPX_APU_UWP_TRACE("finished DSP init");
 
     Error *local_err = NULL;
+    MCPX_APU_UWP_TRACE("entering SDL audio monitor init");
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
     }
+    MCPX_APU_UWP_TRACE("finished SDL audio monitor init");
 
+    MCPX_APU_UWP_TRACE("registering VM state change handler");
     qemu_add_vm_change_state_handler(mcpx_apu_vm_state_change, d);
+    MCPX_APU_UWP_TRACE("creating APU frame thread");
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread", mcpx_apu_frame_thread,
                        d, QEMU_THREAD_JOINABLE);
+    MCPX_APU_UWP_TRACE("waiting for APU frame thread idle state");
     mcpx_apu_wait_for_idle(d);
+    MCPX_APU_UWP_TRACE("APU frame thread reached idle state");
     qemu_mutex_unlock(&d->lock);
+    MCPX_APU_UWP_TRACE("finished");
 }
 
 static void mcpx_apu_exitfn(PCIDevice *dev)
@@ -613,11 +642,14 @@ type_init(mcpx_apu_register);
 
 void mcpx_apu_init(PCIBus *bus, int devfn, MemoryRegion *ram)
 {
+    MCPX_APU_UWP_INIT_TRACE("creating PCI device");
     PCIDevice *dev = pci_create_simple(bus, devfn, "mcpx-apu");
     MCPXAPUState *d = MCPX_APU_DEVICE(dev);
 
     g_state = d;
 
+    MCPX_APU_UWP_INIT_TRACE("binding RAM region");
     d->ram = ram;
     d->ram_ptr = memory_region_get_ram_ptr(d->ram);
+    MCPX_APU_UWP_INIT_TRACE("finished");
 }

@@ -144,6 +144,7 @@
 #include "qemu/keyval.h"
 
 #include "ui/xemu-settings.h"
+#include "ui/xemu-game-library.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-net.h"
 #include "ui/xemu-input.h"
@@ -2767,10 +2768,20 @@ static void qemu_init_board(void)
     MachineClass *machine_class = MACHINE_GET_CLASS(current_machine);
 
     /* process plugin before CPUs are created, but once -smp has been parsed */
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init_board entering plugin load\n");
+#endif
     qemu_plugin_load_list(&plugin_list, &error_fatal);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init_board finished plugin load\n");
+    fprintf(stderr, "xemu UWP: qemu_init_board entering machine_run_board_init\n");
+#endif
 
     /* From here on we enter MACHINE_PHASE_INITIALIZED.  */
     machine_run_board_init(current_machine, mem_path, &error_fatal);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init_board finished machine_run_board_init\n");
+#endif
 
     if (machine_class->auto_create_sdcard) {
         bool ambigous;
@@ -2786,8 +2797,14 @@ static void qemu_init_board(void)
     }
 
     drive_check_orphaned();
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init_board finished drive orphan check\n");
+#endif
 
     realtime_init();
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init_board finished realtime init\n");
+#endif
 }
 
 static void qemu_create_cli_devices(void)
@@ -2864,22 +2881,47 @@ void qmp_x_exit_preconfig(Error **errp)
         return;
     }
 
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig entering board init\n");
+#endif
     qemu_init_board();
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig finished board init\n");
+    fprintf(stderr, "xemu UWP: x_exit_preconfig entering CLI device init\n");
+#endif
     qemu_create_cli_devices();
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig finished CLI device init\n");
+#endif
 
 #ifdef XBOX
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig applying Xbox network mode\n");
+#endif
     if (g_config.net.enable) {
         xemu_net_enable();
     } else {
         xemu_net_disable();
     }
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig finished Xbox network mode\n");
+#endif
 #endif
 
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig entering machine creation done\n");
+#endif
     if (!qemu_machine_creation_done(errp)) {
         return;
     }
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: x_exit_preconfig finished machine creation done\n");
+#endif
 
     if (loadvm) {
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+        fprintf(stderr, "xemu UWP: x_exit_preconfig loading snapshot\n");
+#endif
         RunState state = autostart ? RUN_STATE_RUNNING : runstate_get();
         load_snapshot(loadvm, NULL, false, NULL, &error_fatal);
         load_snapshot_resume(state);
@@ -2902,7 +2944,13 @@ void qmp_x_exit_preconfig(Error **errp)
             }
         }
     } else if (autostart) {
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+        fprintf(stderr, "xemu UWP: x_exit_preconfig entering qmp_cont\n");
+#endif
         qmp_cont(NULL);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+        fprintf(stderr, "xemu UWP: x_exit_preconfig finished qmp_cont\n");
+#endif
     }
 }
 
@@ -2916,6 +2964,10 @@ static const char *get_eeprom_path(void)
     }
 
     if (qemu_access(path, F_OK) == -1) {
+        /* The configured storage may not have its folder yet. */
+        gchar *folder = g_path_get_dirname(path);
+        g_mkdir_with_parents(folder, 0755);
+        g_free(folder);
         if (!xbox_eeprom_generate(path, XBOX_EEPROM_VERSION_R1)) {
             char *msg = g_strdup_printf("Failed to generate EEPROM file '%s'."
                                         "\n\nPlease check machine settings.",
@@ -3074,6 +3126,7 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *dvd_path = g_config.sys.files.dvd_path;
+    bool dvd_path_from_cmdline = false;
     // Allow overriding the dvd path from command line
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "-dvd_path") == 0) {
@@ -3081,9 +3134,20 @@ void qemu_init(int argc, char **argv)
             if (i < argc - 1 && argv[i+1]) {
                 dvd_path = argv[i+1];
                 argv[i+1] = NULL;
+                dvd_path_from_cmdline = true;
             }
             break;
         }
+    }
+
+    /*
+     * Open the game library first and start the machine once a title is
+     * chosen, unless the launch already names a disc.
+     */
+    if (autostart && g_config.general.library_on_launch &&
+        !dvd_path_from_cmdline) {
+        autostart = 0;
+        xemu_game_library_startup_pending = true;
     }
 
     // Always populate DVD drive. If disc path is the empty string, drive is
@@ -3112,6 +3176,9 @@ void qemu_init(int argc, char **argv)
         printf("%s ", fake_argv[i]);
     }
     printf("\n");
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init argument expansion complete\n");
+#endif
 
     argc = fake_argc;
     argv = fake_argv;
@@ -4088,7 +4155,13 @@ void qemu_init(int argc, char **argv)
      * check against compatibilities on the backend memories (e.g. postcopy
      * over memory-backend-file objects).
      */
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init entering late backend creation\n");
+#endif
     qemu_create_late_backends();
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init finished late backend creation\n");
+#endif
     phase_advance(PHASE_LATE_BACKENDS_CREATED);
 
     /*
@@ -4115,9 +4188,21 @@ void qemu_init(int argc, char **argv)
     }
 
     if (!preconfig_requested) {
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+        fprintf(stderr, "xemu UWP: qemu_init entering x_exit_preconfig\n");
+#endif
         qmp_x_exit_preconfig(&error_fatal);
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+        fprintf(stderr, "xemu UWP: qemu_init finished x_exit_preconfig\n");
+#endif
     }
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init entering display init\n");
+#endif
     qemu_init_displays();
+#if defined(CONFIG_UWP) && defined(XEMU_UWP_BOOT_TRACE)
+    fprintf(stderr, "xemu UWP: qemu_init finished display init\n");
+#endif
     accel_setup_post(current_machine);
     if (migrate_mode() != MIG_MODE_CPR_EXEC) {
         os_setup_post();

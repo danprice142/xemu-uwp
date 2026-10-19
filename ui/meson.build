@@ -21,10 +21,17 @@ subdir('thirdparty')
 
 xemu_ss = ss.source_set()
 xemu_ss.add(files(
+  'xemu-dsu.c',
   'xemu-input.c',
+  'xemu-game-library.cc',
+  'xemu-library-server.c',
+  'xemu-screenscraper.cc',
   'xemu-monitor.c',
   'xemu-net.c',
   'xemu-settings.cc',
+  'xemu-stream.c',
+  'xemu-stream-audio.c',
+  'xemu-pointer-aim.c',
   'xemu-controllers.cc',
 
   'xemu.c',
@@ -32,10 +39,26 @@ xemu_ss.add(files(
   'xemu-snapshots.c',
   'xemu-thumbnail.cc',
   'xemu-widescreen.c',
+  'xemu-image.cc',
 ))
+
+xemu_ss.add(files('uwp-osk.cpp'))
+if is_uwp
+  xemu_ss.add(files('uwp-main.cpp', 'uwp-lifecycle.cpp', 'uwp-gamepad.cpp',
+                    'xemu-stream-uwp.cpp', 'uwp-password-vault.cpp'),
+              uwp_media_stream)
+endif
+
+if ffmpeg.found()
+  xemu_ss.add(ffmpeg)
+endif
 
 if host_os == 'windows'
   xemu_ss.add(nvapi)
+endif
+
+if d3d12.found()
+  xemu_ss.add(files('d3d12-presenter.cc'), d3d12)
 endif
 
 subdir('xui')
@@ -49,6 +72,7 @@ if host_os == 'linux'
   xemu_ss.add([gtk, files('xemu-os-utils-linux.c')])
 elif host_os == 'windows'
   xemu_ss.add(files('xemu-os-utils-windows.c'))
+  xemu_ss.add(files('xemu-launch-uri.c'))
 elif host_os == 'darwin'
   xemu_ss.add(files('xemu-os-utils-macos.m'))
 endif

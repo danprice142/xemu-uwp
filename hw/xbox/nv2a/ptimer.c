@@ -34,6 +34,7 @@ static uint64_t ptimer_get_clock(NV2AState *d)
 uint64_t ptimer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = opaque;
+    qatomic_inc(&d->mmio_reads.ptimer);
 
     uint64_t r = 0;
     switch (addr) {

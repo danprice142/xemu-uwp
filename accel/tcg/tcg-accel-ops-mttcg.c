@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/cpus.h"
 #include "system/tcg.h"
 #include "system/replay.h"
 #include "exec/icount.h"
@@ -90,8 +91,16 @@ static void *mttcg_cpu_thread_fn(void *arg)
         if (cpu_can_run(cpu)) {
             int r;
             bql_unlock();
-            r = tcg_cpu_exec(cpu);
-            bql_lock();
+            {
+                int64_t exec_start = g_get_monotonic_time();
+                int64_t lock_start;
+
+                r = tcg_cpu_exec(cpu);
+                lock_start = g_get_monotonic_time();
+                qemu_vcpu_exec_us += lock_start - exec_start;
+                bql_lock();
+                qemu_vcpu_bql_us += g_get_monotonic_time() - lock_start;
+            }
             switch (r) {
             case EXCP_DEBUG:
                 cpu_handle_guest_debug(cpu);

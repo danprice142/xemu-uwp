@@ -430,6 +430,11 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
     PGRAPHGLState *r = d->pgraph.gl_renderer_state;
     bool wait_for_downloads = false;
 
+    if (r == NULL) {
+        qemu_mutex_unlock(&d->pgraph.lock);
+        return;
+    }
+
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         if (!check_surface_overlaps_range(surface, addr, len)) {
@@ -525,9 +530,8 @@ static SurfaceBinding *surface_put(NV2AState *d, hwaddr addr,
     assert(surface_out != NULL);
     *surface_out = *surface_in;
 
-    register_cpu_access_callback(d, surface_out);
-
     QTAILQ_INSERT_TAIL(&r->surfaces, surface_out, entry);
+    register_cpu_access_callback(d, surface_out);
 
     return surface_out;
 }

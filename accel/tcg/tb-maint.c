@@ -18,6 +18,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/cpus.h"
+#include "exec/cpu-common.h"
+#include "system/memory.h"
 #include "qemu/interval-tree.h"
 #include "qemu/qtree.h"
 #include "exec/cputlb.h"
@@ -41,6 +44,7 @@
 #include "system/runstate.h"
 #endif
 #include "trace.h"
+#include "accel/tcg/xbox-fastmem.h"
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
 #define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
@@ -905,6 +909,16 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 
     if (tb_cflags(tb) & CF_PCREL) {
         /* A TB may be at any virtual address */
+#ifdef XBOX
+        /*
+         * Leave the entries in place. @tb already carries CF_INVALID, which
+         * no lookup state contains, so tb_lookup() misses on them and
+         * overwrites the slot. Titles that store next to their code
+         * invalidate TBs at a high rate, and a full flush for each would
+         * make every following indirect jump miss.
+         */
+        return;
+#endif
         CPU_FOREACH(cpu) {
             tcg_flush_jmp_cache(cpu);
         }
@@ -928,6 +942,24 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
  */
 static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 {
+#ifdef XBOX
+    static unsigned logged;
+
+    qatomic_set(&qemu_tb_invalidates, qemu_tb_invalidates + 1);
+    if (xbox_diag_log && logged < 48) {
+        ram_addr_t off = 0;
+        RAMBlock *rb = qemu_ram_block_from_host(
+            qemu_map_ram_ptr(NULL, tb_page_addr0(tb)), false, &off);
+
+        logged++;
+        fprintf(stderr, "xbox tbinv ram=0x%08" PRIx64 " block=%s+0x%" PRIx64
+                " size=%u caller=%p/%p self=%p\n",
+                (uint64_t)tb_page_addr0(tb),
+                rb ? qemu_ram_get_idstr(rb) : "?", (uint64_t)off,
+                (unsigned)tb->size, __builtin_return_address(0),
+                __builtin_return_address(1), (void *)do_tb_phys_invalidate);
+    }
+#endif
     uint32_t h;
     tb_page_addr_t phys_pc;
     uint32_t orig_cflags = tb_cflags(tb);

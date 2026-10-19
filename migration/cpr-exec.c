@@ -138,6 +138,10 @@ static void cpr_exec_cb(void *opaque)
     char **argv = strv_from_str_list(s->parameters.cpr_exec_command);
     Error *err = NULL;
 
+#ifdef CONFIG_UWP
+    error_setg(&err, "CPR exec migration is not supported in a UWP app "
+               "container (command: %s)", argv && argv[0] ? argv[0] : "<none>");
+#else
     /*
      * Clear the close-on-exec flag for all preserved fd's.  We cannot do so
      * earlier because they should not persist across miscellaneous fork and
@@ -153,8 +157,9 @@ static void cpr_exec_cb(void *opaque)
      * or the system is very short on resources.
      */
     error_setg_errno(&err, errno, "execvp %s failed", argv[0]);
-    g_clear_pointer(&argv, g_strfreev);
     cpr_exec_unpreserve_fds();
+#endif
+    g_clear_pointer(&argv, g_strfreev);
 
     error_report_err(error_copy(err));
     migrate_set_state(&s->state, s->state, MIGRATION_STATUS_FAILED);

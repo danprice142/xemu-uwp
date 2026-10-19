@@ -25,11 +25,16 @@
 uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
+    qatomic_inc(&d->mmio_reads.user);
 
     unsigned int channel_id = addr >> 16;
     assert(channel_id < NV2A_NUM_CHANNELS);
 
+    int64_t wait_start = g_get_monotonic_time();
     qemu_mutex_lock(&d->pfifo.lock);
+    qatomic_set(&d->mmio_reads.user_wait_us,
+                d->mmio_reads.user_wait_us +
+                    g_get_monotonic_time() - wait_start);
 
     uint32_t channel_modes = d->pfifo.regs[NV_PFIFO_MODE];
 

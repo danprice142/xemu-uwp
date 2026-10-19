@@ -30,11 +30,13 @@ NotificationManager::NotificationManager()
 
 void NotificationManager::QueueNotification(const char *msg)
 {
+    std::lock_guard<std::mutex> lock(m_queue_lock);
     m_notification_queue.push_back(strdup(msg));
 }
 
 void NotificationManager::QueueError(const char *msg)
 {
+    std::lock_guard<std::mutex> lock(m_queue_lock);
     m_error_queue.push_back(strdup(msg));
 }
 
@@ -56,6 +58,7 @@ void NotificationManager::Draw()
         }
     } else {
         // Check to see if a notification is pending
+        std::lock_guard<std::mutex> lock(m_queue_lock);
         if (m_notification_queue.size() > 0) {
             m_msg = m_notification_queue[0];
             m_active = true;
@@ -66,22 +69,33 @@ void NotificationManager::Draw()
 
     ImGuiIO& io = ImGui::GetIO();
 
-    if (m_error_queue.size() > 0) {
+    /* Only this thread removes errors, so the front stays valid. */
+    const char *error = NULL;
+    {
+        std::lock_guard<std::mutex> lock(m_queue_lock);
+        if (m_error_queue.size() > 0) {
+            error = m_error_queue[0];
+        }
+    }
+    if (error != NULL) {
         ImGui::OpenPopup("Error");
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x/2, io.DisplaySize.y/2),
                                 ImGuiCond_Always, ImVec2(0.5, 0.5));
     }
     if (ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize))
     {
-        ImGui::Text("%s", m_error_queue[0]);
+        ImGui::Text("%s", error != NULL ? error : "");
         ImGui::Dummy(ImVec2(0,16));
         ImGui::SetItemDefaultFocus();
         ImGuiStyle &style = ImGui::GetStyle();
         ImGui::SetCursorPosX(ImGui::GetWindowWidth()-(120+2*style.FramePadding.x));
         if (ImGui::Button("Ok", ImVec2(120, 0))) {
             ImGui::CloseCurrentPopup();
-            free((void*)m_error_queue[0]);
-            m_error_queue.pop_front();
+            if (error != NULL) {
+                std::lock_guard<std::mutex> lock(m_queue_lock);
+                free((void *)m_error_queue[0]);
+                m_error_queue.pop_front();
+            }
         }
         ImGui::EndPopup();
     }

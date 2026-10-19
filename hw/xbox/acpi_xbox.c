@@ -68,13 +68,14 @@ static uint64_t xbox_pm_gpio_read(void *opaque, hwaddr addr, unsigned width)
 static void xbox_pm_gpio_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned width)
 {
+    XBOX_PMRegs *pm = opaque;
+
     XBOX_DPRINTF("pm gpio write [0x%llx] = 0x%llx\n", addr, val);
 
     if (addr == XBOX_PM_GPIO_ASPECT_RATIO) {
+        pm->gpio_aspect = val;
         xemu_set_widescreen(val == 5);
     }
-
-    // FIXME: Add GPIO to VM state
 }
 
 static const MemoryRegionOps xbox_pm_gpio_ops = {
@@ -132,6 +133,25 @@ static void xbox_pm_gpe_writeb(void *opaque, hwaddr addr, uint64_t val,
      .offset     = vmstate_offset_pointer(_state, _field, uint8_t),  \
  }
 
+static int xbox_pm_gpio_post_load(void *opaque, int version_id)
+{
+    XBOX_PMRegs *pm = opaque;
+
+    xemu_set_widescreen(pm->gpio_aspect == 5);
+    return 0;
+}
+
+static const VMStateDescription vmstate_xbox_pm_gpio = {
+    .name = "xbox-pm/gpio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = xbox_pm_gpio_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(gpio_aspect, XBOX_PMRegs),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 const VMStateDescription vmstate_xbox_pm = {
     .name = "xbox-pm",
     .version_id = 1,
@@ -145,6 +165,10 @@ const VMStateDescription vmstate_xbox_pm = {
         VMSTATE_GPE_ARRAY(acpi_regs.gpe.sts, XBOX_PMRegs),
         VMSTATE_GPE_ARRAY(acpi_regs.gpe.en, XBOX_PMRegs),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_xbox_pm_gpio,
+        NULL
     },
 };
 
@@ -170,6 +194,18 @@ static void pm_reset(void *opaque)
     acpi_update_sci(&pm->acpi_regs, pm->irq);
 }
 
+/*
+ * The next title reports its own aspect when it sets a video mode. A
+ * snapshot load keeps the current aspect, as older snapshots lack it.
+ */
+static void pm_gpio_reset(void *opaque)
+{
+    XBOX_PMRegs *pm = opaque;
+
+    pm->gpio_aspect = 0;
+    xemu_set_widescreen(false);
+}
+
 void xbox_pm_init(PCIDevice *dev, XBOX_PMRegs *pm, qemu_irq sci_irq)
 {
     memory_region_init(&pm->io, OBJECT(dev), "xbox-pm", 256);
@@ -191,4 +227,5 @@ void xbox_pm_init(PCIDevice *dev, XBOX_PMRegs *pm, qemu_irq sci_irq)
 
     pm->irq = sci_irq;
     qemu_register_reset(pm_reset, pm);
+    qemu_register_reset_nosnapshotload(pm_gpio_reset, pm);
 }

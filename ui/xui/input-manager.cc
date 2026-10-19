@@ -23,13 +23,29 @@ void InputManager::Update()
     if (!g_main_menu.IsInputRebinding()) {
         ControllerState *iter;
         QTAILQ_FOREACH (iter, &available_controllers, entry) {
-            if (iter->type != INPUT_DEVICE_SDL_GAMEPAD)
+            if (iter->type != INPUT_DEVICE_SDL_GAMEPAD
+#ifdef XEMU_INPUT_UWP
+                && iter->type != INPUT_DEVICE_UWP_GAMEPAD
+#endif
+            ) {
                 continue;
+            }
             m_buttons |= iter->buttons;
             // We simply take any axis that is >10 % activation
             for (int i = 0; i < CONTROLLER_AXIS__COUNT; i++) {
                 if ((iter->axis[i] > 3276) || (iter->axis[i] < -3276)) {
                     axis[i] = iter->axis[i];
+                }
+            }
+        }
+
+        // Network (DSU) gamepads drive the interface too.
+        XemuInputSample dsu;
+        if (xemu_input_get_dsu_ui_sample(&dsu)) {
+            m_buttons |= dsu.buttons;
+            for (int i = 0; i < CONTROLLER_AXIS__COUNT; i++) {
+                if ((dsu.axis[i] > 3276) || (dsu.axis[i] < -3276)) {
+                    axis[i] = dsu.axis[i];
                 }
             }
         }
