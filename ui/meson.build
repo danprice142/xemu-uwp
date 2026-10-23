@@ -45,7 +45,8 @@ xemu_ss.add(files(
 xemu_ss.add(files('uwp-osk.cpp'))
 if is_uwp
   xemu_ss.add(files('uwp-main.cpp', 'uwp-lifecycle.cpp', 'uwp-gamepad.cpp',
-                    'xemu-stream-uwp.cpp', 'uwp-password-vault.cpp'),
+                    'xemu-stream-uwp.cpp', 'uwp-password-vault.cpp',
+                    'uwp-file-redirect.c'),
               uwp_media_stream)
 endif
 

@@ -38,6 +38,7 @@
 
 #include "xemu-main.h"
 #include "xemu-game-library.h"
+#include "uwp-file-redirect.h"
 #include "xui/actions.hh"
 
 extern "C" {
@@ -139,6 +140,9 @@ void xemu_uwp_process_activation(void)
 
 int main(int argc, char **argv)
 {
+    /* Games on any USB drive, without the NTFS + permissions step on a PC. */
+    xemu_uwp_redirect_file_apis();
+
     std::vector<char *> launch_argv;
     char *activation_uri = cold_start_launch_uri();
 
